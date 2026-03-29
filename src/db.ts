@@ -1,0 +1,528 @@
+import Database from "better-sqlite3";
+import { resolve, dirname } from "node:path";
+import { mkdirSync, existsSync } from "node:fs";
+import type { CandidateReport, IssueRef, ScanPerformanceMetrics, ScanReport, ScanStatus, SearchRepo, StepTiming } from "./types.js";
+
+let _db: Database.Database | undefined;
+
+export function getDb(dbPath: string): Database.Database {
+  if (_db) return _db;
+  const resolved = resolve(dbPath);
+  const dir = dirname(resolved);
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+  _db = new Database(resolved);
+  _db.pragma("journal_mode = WAL");
+  _db.pragma("foreign_keys = ON");
+  migrate(_db);
+  return _db;
+}
+
+function migrate(db: Database.Database): void {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS repos (
+      id            INTEGER PRIMARY KEY AUTOINCREMENT,
+      full_name     TEXT UNIQUE NOT NULL,
+      owner         TEXT NOT NULL,
+      name          TEXT NOT NULL,
+      url           TEXT NOT NULL,
+      stars         INTEGER NOT NULL DEFAULT 0,
+      primary_language TEXT,
+      default_branch TEXT NOT NULL DEFAULT 'main',
+      description   TEXT,
+      is_archived   INTEGER NOT NULL DEFAULT 0,
+      pushed_at     TEXT,
+      disk_usage_kb INTEGER,
+      created_at    TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at    TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS pull_requests (
+      id            INTEGER PRIMARY KEY AUTOINCREMENT,
+      repo_id       INTEGER NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
+      number        INTEGER NOT NULL,
+      url           TEXT NOT NULL,
+      title         TEXT NOT NULL,
+      body          TEXT,
+      merged_at     TEXT,
+      changed_files INTEGER,
+      labels        TEXT,
+      base_ref_name TEXT NOT NULL,
+      base_ref_oid  TEXT NOT NULL,
+      head_ref_oid  TEXT NOT NULL,
+      created_at    TEXT NOT NULL DEFAULT (datetime('now')),
+      UNIQUE(repo_id, number)
+    );
+
+    CREATE TABLE IF NOT EXISTS issues (
+      id            INTEGER PRIMARY KEY AUTOINCREMENT,
+      pr_id         INTEGER NOT NULL REFERENCES pull_requests(id) ON DELETE CASCADE,
+      owner         TEXT NOT NULL,
+      repo          TEXT NOT NULL,
+      number        INTEGER NOT NULL,
+      url           TEXT,
+      title         TEXT,
+      body          TEXT,
+      state         TEXT,
+      link_type     TEXT NOT NULL,
+      created_at    TEXT NOT NULL DEFAULT (datetime('now')),
+      UNIQUE(pr_id, owner, repo, number)
+    );
+
+    CREATE TABLE IF NOT EXISTS scans (
+      id            INTEGER PRIMARY KEY AUTOINCREMENT,
+      status        TEXT NOT NULL DEFAULT 'running',
+      config_json   TEXT NOT NULL,
+      started_at    TEXT NOT NULL DEFAULT (datetime('now')),
+      finished_at   TEXT,
+      total_duration_ms INTEGER,
+      accepted_count  INTEGER NOT NULL DEFAULT 0,
+      rejected_count  INTEGER NOT NULL DEFAULT 0
+    );
+
+    CREATE TABLE IF NOT EXISTS scan_candidates (
+      id              INTEGER PRIMARY KEY AUTOINCREMENT,
+      scan_id         INTEGER NOT NULL REFERENCES scans(id) ON DELETE CASCADE,
+      repo_id         INTEGER NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
+      pr_id           INTEGER REFERENCES pull_requests(id) ON DELETE SET NULL,
+      accepted        INTEGER NOT NULL DEFAULT 0,
+      pre_fix_sha     TEXT,
+      rejection_reasons TEXT,
+      tests_unable_to_run INTEGER NOT NULL DEFAULT 0,
+      tests_unable_to_run_reason TEXT,
+      timings_json    TEXT,
+      details_json    TEXT,
+      created_at      TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+  `);
+
+  const scanColumns = db.prepare("PRAGMA table_info(scans)").all() as Array<{ name: string }>;
+  if (!scanColumns.some((column) => column.name === "metrics_json")) {
+    db.exec("ALTER TABLE scans ADD COLUMN metrics_json TEXT");
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* Repos                                                               */
+/* ------------------------------------------------------------------ */
+
+export function upsertRepo(db: Database.Database, repo: SearchRepo): number {
+  const stmt = db.prepare(`
+    INSERT INTO repos (full_name, owner, name, url, stars, primary_language, default_branch, description, is_archived, pushed_at, disk_usage_kb, updated_at)
+    VALUES (@fullName, @owner, @name, @url, @stars, @primaryLanguage, @defaultBranch, @description, @isArchived, @pushedAt, @diskUsageKb, datetime('now'))
+    ON CONFLICT(full_name) DO UPDATE SET
+      stars = @stars,
+      primary_language = @primaryLanguage,
+      description = @description,
+      is_archived = @isArchived,
+      pushed_at = @pushedAt,
+      disk_usage_kb = @diskUsageKb,
+      updated_at = datetime('now')
+  `);
+  stmt.run({
+    fullName: repo.fullName,
+    owner: repo.owner,
+    name: repo.name,
+    url: repo.url,
+    stars: repo.stars,
+    primaryLanguage: repo.primaryLanguage ?? null,
+    defaultBranch: repo.defaultBranch,
+    description: repo.description ?? null,
+    isArchived: repo.isArchived ? 1 : 0,
+    pushedAt: repo.pushedAt ?? null,
+    diskUsageKb: repo.diskUsageKb ?? null,
+  });
+  const row = db.prepare("SELECT id FROM repos WHERE full_name = ?").get(repo.fullName) as { id: number };
+  return row.id;
+}
+
+export function repoHasAcceptedCandidate(db: Database.Database, fullName: string): boolean {
+  const row = db.prepare(`
+    SELECT 1 FROM scan_candidates sc
+    JOIN repos r ON r.id = sc.repo_id
+    WHERE r.full_name = ? AND sc.accepted = 1
+    LIMIT 1
+  `).get(fullName) as { 1: number } | undefined;
+  return Boolean(row);
+}
+
+export function getRepos(db: Database.Database, opts: { search?: string; limit?: number; offset?: number } = {}): { rows: any[]; total: number } {
+  const limit = opts.limit ?? 50;
+  const offset = opts.offset ?? 0;
+  const where = opts.search ? "WHERE r.full_name LIKE @search OR r.description LIKE @search" : "";
+  const params: any = opts.search ? { search: `%${opts.search}%` } : {};
+
+  const total = (db.prepare(`SELECT COUNT(*) as cnt FROM repos r ${where}`).get(params) as any).cnt;
+  const rows = db.prepare(`
+    SELECT r.*,
+      (SELECT COUNT(*) FROM scan_candidates sc WHERE sc.repo_id = r.id AND sc.accepted = 1) as accepted_count,
+      (SELECT COUNT(*) FROM scan_candidates sc WHERE sc.repo_id = r.id AND sc.accepted = 0) as rejected_count,
+      (SELECT COUNT(*) FROM pull_requests pr WHERE pr.repo_id = r.id) as pr_count,
+      (SELECT COUNT(DISTINCT i.id) FROM issues i JOIN pull_requests pr ON pr.id = i.pr_id WHERE pr.repo_id = r.id) as issue_count
+    FROM repos r ${where}
+    ORDER BY r.updated_at DESC
+    LIMIT ${limit} OFFSET ${offset}
+  `).all(params);
+  return { rows, total };
+}
+
+export function getRepoById(db: Database.Database, id: number): any {
+  const repo = db.prepare("SELECT * FROM repos WHERE id = ?").get(id);
+  if (!repo) return undefined;
+  const prs = db.prepare(`
+    SELECT pr.*, 
+      (SELECT COUNT(*) FROM issues i WHERE i.pr_id = pr.id) as issue_count
+    FROM pull_requests pr WHERE pr.repo_id = ? ORDER BY pr.merged_at DESC
+  `).all(id);
+  const issues = db.prepare(`
+    SELECT i.*, pr.number as pr_number, pr.title as pr_title
+    FROM issues i
+    JOIN pull_requests pr ON pr.id = i.pr_id
+    WHERE pr.repo_id = ?
+    ORDER BY i.created_at DESC
+  `).all(id);
+  const candidates = db.prepare(`
+    SELECT sc.* FROM scan_candidates sc WHERE sc.repo_id = ? ORDER BY sc.created_at DESC
+  `).all(id);
+  return { ...repo as any, pullRequests: prs, issues, candidates };
+}
+
+export function deleteRepo(db: Database.Database, id: number): boolean {
+  const result = db.prepare("DELETE FROM repos WHERE id = ?").run(id);
+  return result.changes > 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* Pull Requests                                                       */
+/* ------------------------------------------------------------------ */
+
+export function upsertPullRequest(db: Database.Database, repoId: number, pr: { number: number; url: string; title: string; body: string; mergedAt?: string | null; changedFilesCount?: number; labels: string[]; baseRefName: string; baseRefOid: string; headRefOid: string }): number {
+  db.prepare(`
+    INSERT INTO pull_requests (repo_id, number, url, title, body, merged_at, changed_files, labels, base_ref_name, base_ref_oid, head_ref_oid)
+    VALUES (@repoId, @number, @url, @title, @body, @mergedAt, @changedFiles, @labels, @baseRefName, @baseRefOid, @headRefOid)
+    ON CONFLICT(repo_id, number) DO UPDATE SET
+      title = @title, body = @body, merged_at = @mergedAt, changed_files = @changedFiles, labels = @labels
+  `).run({
+    repoId,
+    number: pr.number,
+    url: pr.url,
+    title: pr.title,
+    body: pr.body,
+    mergedAt: pr.mergedAt ?? null,
+    changedFiles: pr.changedFilesCount ?? null,
+    labels: JSON.stringify(pr.labels),
+    baseRefName: pr.baseRefName,
+    baseRefOid: pr.baseRefOid,
+    headRefOid: pr.headRefOid,
+  });
+  const row = db.prepare("SELECT id FROM pull_requests WHERE repo_id = ? AND number = ?").get(repoId, pr.number) as { id: number };
+  return row.id;
+}
+
+/* ------------------------------------------------------------------ */
+/* Issues                                                              */
+/* ------------------------------------------------------------------ */
+
+export function upsertIssue(db: Database.Database, prId: number, issue: IssueRef): void {
+  db.prepare(`
+    INSERT INTO issues (pr_id, owner, repo, number, url, title, body, state, link_type)
+    VALUES (@prId, @owner, @repo, @number, @url, @title, @body, @state, @linkType)
+    ON CONFLICT(pr_id, owner, repo, number) DO UPDATE SET
+      title = @title, body = @body, state = @state, link_type = @linkType
+  `).run({
+    prId,
+    owner: issue.owner,
+    repo: issue.repo,
+    number: issue.number,
+    url: issue.url ?? null,
+    title: issue.title ?? null,
+    body: issue.body ?? null,
+    state: issue.state ?? null,
+    linkType: issue.linkType,
+  });
+}
+
+/* ------------------------------------------------------------------ */
+/* Scans                                                               */
+/* ------------------------------------------------------------------ */
+
+export function createScan(db: Database.Database, configJson: string): number {
+  const result = db.prepare("INSERT INTO scans (config_json, status) VALUES (?, 'running')").run(configJson);
+  return Number(result.lastInsertRowid);
+}
+
+export function finishScan(
+  db: Database.Database,
+  scanId: number,
+  status: ScanStatus,
+  totalDurationMs: number,
+  acceptedCount: number,
+  rejectedCount: number,
+  performanceMetrics?: ScanPerformanceMetrics,
+): void {
+  db.prepare(`
+    UPDATE scans SET status = ?, finished_at = datetime('now'), total_duration_ms = ?, accepted_count = ?, rejected_count = ?, metrics_json = ?
+    WHERE id = ?
+  `).run(
+    status,
+    totalDurationMs,
+    acceptedCount,
+    rejectedCount,
+    performanceMetrics ? JSON.stringify(performanceMetrics) : null,
+    scanId,
+  );
+}
+
+export function getScans(db: Database.Database, limit = 50, offset = 0): { rows: any[]; total: number } {
+  const total = (db.prepare("SELECT COUNT(*) as cnt FROM scans").get() as any).cnt;
+  const rows = db.prepare("SELECT * FROM scans ORDER BY started_at DESC LIMIT ? OFFSET ?").all(limit, offset);
+  return { rows, total };
+}
+
+export function getScanById(db: Database.Database, id: number): any {
+  const scan = db.prepare("SELECT * FROM scans WHERE id = ?").get(id);
+  if (!scan) return undefined;
+  const candidates = db.prepare(`
+    SELECT sc.*, r.full_name as repo_full_name, r.stars as repo_stars
+    FROM scan_candidates sc
+    JOIN repos r ON r.id = sc.repo_id
+    WHERE sc.scan_id = ?
+    ORDER BY sc.accepted DESC, sc.created_at ASC
+  `).all(id);
+  return { ...scan as any, candidates };
+}
+
+/* ------------------------------------------------------------------ */
+/* Scan candidates                                                     */
+/* ------------------------------------------------------------------ */
+
+export function insertScanCandidate(
+  db: Database.Database,
+  scanId: number,
+  repoId: number,
+  prId: number | null,
+  candidate: CandidateReport,
+): number {
+  const result = db.prepare(`
+    INSERT INTO scan_candidates (scan_id, repo_id, pr_id, accepted, pre_fix_sha, rejection_reasons, tests_unable_to_run, tests_unable_to_run_reason, timings_json, details_json)
+    VALUES (@scanId, @repoId, @prId, @accepted, @preFixSha, @rejectionReasons, @testsUnableToRun, @testsUnableToRunReason, @timingsJson, @detailsJson)
+  `).run({
+    scanId,
+    repoId,
+    prId,
+    accepted: candidate.accepted ? 1 : 0,
+    preFixSha: candidate.preFixSha || null,
+    rejectionReasons: JSON.stringify(candidate.rejectionReasons),
+    testsUnableToRun: candidate.testsUnableToRun ? 1 : 0,
+    testsUnableToRunReason: candidate.testsUnableToRunReason ?? null,
+    timingsJson: JSON.stringify(candidate.timings),
+    detailsJson: JSON.stringify({
+      screening: candidate.screening,
+      analysis: candidate.analysis,
+      testPlan: candidate.testPlan,
+      execution: candidate.execution,
+    }),
+  });
+  return Number(result.lastInsertRowid);
+}
+
+/* ------------------------------------------------------------------ */
+/* Stats / Issues listing                                              */
+/* ------------------------------------------------------------------ */
+
+export function getStats(db: Database.Database): any {
+  const repos = (db.prepare("SELECT COUNT(*) as cnt FROM repos").get() as any).cnt;
+  const prs = (db.prepare("SELECT COUNT(*) as cnt FROM pull_requests").get() as any).cnt;
+  const issues = (db.prepare("SELECT COUNT(*) as cnt FROM issues").get() as any).cnt;
+  const scans = (db.prepare("SELECT COUNT(*) as cnt FROM scans").get() as any).cnt;
+  const accepted = (db.prepare("SELECT COUNT(*) as cnt FROM scan_candidates WHERE accepted = 1").get() as any).cnt;
+  const rejected = (db.prepare("SELECT COUNT(*) as cnt FROM scan_candidates WHERE accepted = 0").get() as any).cnt;
+  const testsUnableToRun = (db.prepare("SELECT COUNT(*) as cnt FROM scan_candidates WHERE tests_unable_to_run = 1").get() as any).cnt;
+  const lastScan = db.prepare("SELECT * FROM scans ORDER BY started_at DESC LIMIT 1").get();
+  return { repos, prs, issues, scans, accepted, rejected, testsUnableToRun, lastScan };
+}
+
+export function getIssues(db: Database.Database, opts: { limit?: number; offset?: number } = {}): { rows: any[]; total: number } {
+  const limit = opts.limit ?? 50;
+  const offset = opts.offset ?? 0;
+  const total = (db.prepare("SELECT COUNT(*) as cnt FROM issues").get() as any).cnt;
+  const rows = db.prepare(`
+    SELECT i.*, pr.number as pr_number, pr.title as pr_title, r.full_name as repo_full_name
+    FROM issues i
+    JOIN pull_requests pr ON pr.id = i.pr_id
+    JOIN repos r ON r.id = pr.repo_id
+    ORDER BY i.created_at DESC
+    LIMIT ? OFFSET ?
+  `).all(limit, offset);
+  return { rows, total };
+}
+
+export function getTestsUnableCandidates(db: Database.Database, limit = 50): { rows: any[]; total: number } {
+  const total = (db.prepare("SELECT COUNT(*) as cnt FROM scan_candidates WHERE tests_unable_to_run = 1").get() as any).cnt;
+  const rows = db.prepare(`
+    SELECT
+      sc.*,
+      s.id as scan_id,
+      s.status as scan_status,
+      s.started_at as scan_started_at,
+      r.full_name as repo_full_name,
+      r.stars as repo_stars,
+      pr.number as pr_number,
+      pr.title as pr_title,
+      pr.url as pr_url
+    FROM scan_candidates sc
+    JOIN scans s ON s.id = sc.scan_id
+    JOIN repos r ON r.id = sc.repo_id
+    LEFT JOIN pull_requests pr ON pr.id = sc.pr_id
+    WHERE sc.tests_unable_to_run = 1
+    ORDER BY sc.created_at DESC
+    LIMIT ?
+  `).all(limit);
+  return { rows, total };
+}
+
+export function getAcceptedCandidates(
+  db: Database.Database,
+  opts: { limit?: number; offset?: number; reviewStatus?: string } = {},
+): { rows: any[]; total: number } {
+  const limit = opts.limit ?? 50;
+  const offset = opts.offset ?? 0;
+  const reviewStatus = opts.reviewStatus === "reviewing"
+    || opts.reviewStatus === "approved"
+    || opts.reviewStatus === "follow_up"
+    || opts.reviewStatus === "new"
+    ? opts.reviewStatus
+    : "all";
+  const where = [
+    "sc.accepted = 1",
+    reviewStatus === "all"
+      ? ""
+      : "COALESCE(NULLIF(json_extract(sc.details_json, '$.reviewQueue.status'), ''), 'new') = @reviewStatus",
+  ].filter(Boolean).join(" AND ");
+  const params = {
+    reviewStatus,
+    limit,
+    offset,
+  };
+  const total = (db.prepare(`SELECT COUNT(*) as cnt FROM scan_candidates sc WHERE ${where}`).get(params) as any).cnt;
+  const rows = db.prepare(`
+    SELECT
+      sc.*,
+      s.id as scan_id,
+      s.status as scan_status,
+      s.started_at as scan_started_at,
+      r.full_name as repo_full_name,
+      r.url as repo_url,
+      r.stars as repo_stars,
+      r.primary_language as repo_primary_language,
+      pr.number as pr_number,
+      pr.title as pr_title,
+      pr.url as pr_url,
+      pr.merged_at as pr_merged_at
+    FROM scan_candidates sc
+    JOIN scans s ON s.id = sc.scan_id
+    JOIN repos r ON r.id = sc.repo_id
+    LEFT JOIN pull_requests pr ON pr.id = sc.pr_id
+    WHERE ${where}
+    ORDER BY sc.created_at DESC
+    LIMIT @limit OFFSET @offset
+  `).all(params);
+  return { rows, total };
+}
+
+export function getIssuesForCandidate(db: Database.Database, candidateId: number): any[] {
+  return db.prepare(`
+    SELECT
+      i.*,
+      (i.owner || '/' || i.repo) as issue_repo_full_name
+    FROM issues i
+    JOIN scan_candidates sc ON sc.pr_id = i.pr_id
+    WHERE sc.id = ?
+    ORDER BY i.created_at DESC
+  `).all(candidateId);
+}
+
+export function getIssuesForCandidateIds(db: Database.Database, candidateIds: number[]): Record<number, any[]> {
+  if (!candidateIds.length) {
+    return {};
+  }
+  const placeholders = candidateIds.map(() => "?").join(", ");
+  const rows = db.prepare(`
+    SELECT
+      sc.id as candidate_id,
+      i.*,
+      (i.owner || '/' || i.repo) as issue_repo_full_name
+    FROM issues i
+    JOIN scan_candidates sc ON sc.pr_id = i.pr_id
+    WHERE sc.id IN (${placeholders})
+    ORDER BY i.created_at DESC
+  `).all(...candidateIds) as Array<Record<string, unknown> & { candidate_id: number }>;
+
+  const grouped: Record<number, any[]> = {};
+  for (const row of rows) {
+    const candidateId = Number(row.candidate_id);
+    if (!grouped[candidateId]) {
+      grouped[candidateId] = [];
+    }
+    grouped[candidateId].push(row);
+  }
+  return grouped;
+}
+
+export function getScanCandidateById(db: Database.Database, id: number): any {
+  return db.prepare(`
+    SELECT
+      sc.*,
+      s.id as scan_id,
+      s.status as scan_status,
+      r.full_name as repo_full_name,
+      r.owner as repo_owner,
+      r.name as repo_name,
+      r.url as repo_url,
+      r.stars as repo_stars,
+      r.primary_language as repo_primary_language,
+      r.default_branch as repo_default_branch,
+      r.is_archived as repo_is_archived,
+      r.pushed_at as repo_pushed_at,
+      r.disk_usage_kb as repo_disk_usage_kb,
+      r.description as repo_description,
+      pr.number as pr_number,
+      pr.title as pr_title,
+      pr.url as pr_url
+    FROM scan_candidates sc
+    JOIN scans s ON s.id = sc.scan_id
+    JOIN repos r ON r.id = sc.repo_id
+    LEFT JOIN pull_requests pr ON pr.id = sc.pr_id
+    WHERE sc.id = ?
+  `).get(id);
+}
+
+export function updateScanCandidateState(
+  db: Database.Database,
+  candidateId: number,
+  updates: {
+    accepted: boolean;
+    rejectionReasons: string[];
+    testsUnableToRun: boolean;
+    testsUnableToRunReason?: string;
+    detailsJson: string;
+  },
+): void {
+  db.prepare(`
+    UPDATE scan_candidates
+    SET accepted = ?, rejection_reasons = ?, tests_unable_to_run = ?, tests_unable_to_run_reason = ?, details_json = ?
+    WHERE id = ?
+  `).run(
+    updates.accepted ? 1 : 0,
+    JSON.stringify(updates.rejectionReasons),
+    updates.testsUnableToRun ? 1 : 0,
+    updates.testsUnableToRunReason ?? null,
+    updates.detailsJson,
+    candidateId,
+  );
+}
+
+export function refreshScanCounts(db: Database.Database, scanId: number): void {
+  const acceptedCount = (db.prepare("SELECT COUNT(*) as cnt FROM scan_candidates WHERE scan_id = ? AND accepted = 1").get(scanId) as any).cnt;
+  const rejectedCount = (db.prepare("SELECT COUNT(*) as cnt FROM scan_candidates WHERE scan_id = ? AND accepted = 0").get(scanId) as any).cnt;
+  db.prepare("UPDATE scans SET accepted_count = ?, rejected_count = ? WHERE id = ?").run(acceptedCount, rejectedCount, scanId);
+}

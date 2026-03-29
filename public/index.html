@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Repo Issue Miner — Dashboard</title>
+  <meta name="description" content="Mine GitHub repos for merged bug-fix PRs with linked issues and validate pre-fix snapshots in Docker.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <div id="app">
+    <!-- Sidebar -->
+    <nav id="sidebar">
+      <div class="sidebar-logo">
+        <span class="logo-icon">⛏️</span>
+        <h1>Repo Miner</h1>
+      </div>
+      <ul class="nav-links">
+        <li><a href="#" data-page="dashboard" class="active" id="nav-dashboard"><span class="nav-icon">📊</span> Dashboard</a></li>
+        <li><a href="#" data-page="repos" id="nav-repos"><span class="nav-icon">📦</span> Repos</a></li>
+        <li><a href="#" data-page="accepted" id="nav-accepted"><span class="nav-icon">✅</span> Accepted</a></li>
+        <li><a href="#" data-page="issues" id="nav-issues"><span class="nav-icon">🐛</span> Issues</a></li>
+        <li><a href="#" data-page="scans" id="nav-scans"><span class="nav-icon">🔍</span> Scans</a></li>
+        <li><a href="#" data-page="new-scan" id="nav-new-scan"><span class="nav-icon">🚀</span> New Scan</a></li>
+      </ul>
+    </nav>
+
+    <!-- Main content -->
+    <main id="content">
+      <!-- Dashboard page -->
+      <section id="page-dashboard" class="page active">
+        <h2 class="page-title">Dashboard</h2>
+        <p class="page-subtitle">Watch scan results, jump into accepted PRs, and reopen build failures without digging through the database by hand.</p>
+        <div class="card dashboard-guide">
+          <div class="dashboard-guide-copy">
+            <h3>Quick Start</h3>
+            <p>`Issue-first` is the safest default. Use `Single Repo Deep Scan` when you already know the repo you want to mine deeply.</p>
+          </div>
+          <div class="dashboard-action-row">
+            <button type="button" class="btn btn-primary" data-dashboard-action="new-scan">Start New Scan</button>
+            <button type="button" class="btn btn-info" data-dashboard-action="accepted">Review Accepted</button>
+            <button type="button" class="btn btn-info" data-dashboard-action="tests-unable">Open Tests Unable</button>
+          </div>
+        </div>
+        <div class="stats-grid" id="stats-grid"></div>
+        <div class="card" id="last-scan-card" style="display:none;">
+          <h3>Last Scan</h3>
+          <div id="last-scan-info"></div>
+        </div>
+      </section>
+
+      <!-- Repos page -->
+      <section id="page-repos" class="page">
+        <h2 class="page-title">Repositories</h2>
+        <div class="toolbar">
+          <input type="text" id="repo-search" class="search-input" placeholder="Search repos…">
+          <button type="button" class="btn btn-danger" id="delete-selected-repos" disabled>Delete Selected</button>
+        </div>
+        <div class="card">
+          <div class="table-wrap"><table id="repos-table">
+            <thead><tr><th><input type="checkbox" id="select-all-repos" aria-label="Select all repos"></th><th>Repo</th><th>Stars</th><th>Language</th><th>PRs</th><th>Issues</th><th>Status</th><th>Actions</th></tr></thead>
+            <tbody id="repos-tbody"></tbody>
+          </table></div>
+          <div class="pagination" id="repos-pagination"></div>
+        </div>
+      </section>
+
+      <section id="page-accepted" class="page">
+        <h2 class="page-title">Accepted Pull Requests</h2>
+        <div class="toolbar">
+          <select id="accepted-review-filter" class="search-input">
+            <option value="all">All Review States</option>
+            <option value="new">New</option>
+            <option value="reviewing">Reviewing</option>
+            <option value="approved">Approved</option>
+            <option value="follow_up">Follow Up</option>
+          </select>
+        </div>
+        <div id="accepted-list"></div>
+        <div class="pagination" id="accepted-pagination"></div>
+      </section>
+
+      <!-- Repo detail modal -->
+      <div id="repo-detail-modal" class="modal hidden">
+        <div class="modal-content">
+          <button class="modal-close" id="modal-close">&times;</button>
+          <div id="repo-detail-body"></div>
+        </div>
+      </div>
+
+      <!-- Issues page -->
+      <section id="page-issues" class="page">
+        <h2 class="page-title">Verified Issues</h2>
+        <div class="card">
+          <div class="table-wrap"><table id="issues-table">
+            <thead><tr><th>Issue</th><th>Repo</th><th>PR</th><th>State</th><th>Link Type</th></tr></thead>
+            <tbody id="issues-tbody"></tbody>
+          </table></div>
+          <div class="pagination" id="issues-pagination"></div>
+        </div>
+      </section>
+
+      <!-- Scans page -->
+      <section id="page-scans" class="page">
+        <h2 class="page-title">Scan History</h2>
+        <div class="card">
+          <div class="table-wrap"><table id="scans-table">
+            <thead><tr><th>ID</th><th>Status</th><th>Started</th><th>Duration</th><th>Accepted</th><th>Rejected</th><th>Actions</th></tr></thead>
+            <tbody id="scans-tbody"></tbody>
+          </table></div>
+          <div class="pagination" id="scans-pagination"></div>
+        </div>
+      </section>
+
+      <!-- Scan detail modal -->
+      <div id="scan-detail-modal" class="modal hidden">
+        <div class="modal-content modal-wide">
+          <button class="modal-close" id="scan-modal-close">&times;</button>
+          <div id="scan-detail-body"></div>
+        </div>
+      </div>
+
+      <!-- Tests unable modal -->
+      <div id="tests-unable-modal" class="modal hidden">
+        <div class="modal-content modal-wide">
+          <button class="modal-close" id="tests-unable-close">&times;</button>
+          <div id="tests-unable-body"></div>
+        </div>
+      </div>
+
+      <!-- New Scan page -->
+      <section id="page-new-scan" class="page">
+        <h2 class="page-title">Start New Scan</h2>
+        <p class="page-subtitle">Use the defaults for broad discovery, or point the scan at one repo when you want a slower, deeper pass.</p>
+        <div class="card scan-form-card">
+          <form id="scan-form">
+            <div class="form-grid">
+              <div class="form-group">
+                <label for="f-languages">Languages</label>
+                <div class="checkbox-group">
+                  <label class="cb-label"><input type="checkbox" name="lang" value="python" checked> Python</label>
+                  <label class="cb-label"><input type="checkbox" name="lang" value="javascript" checked> JavaScript</label>
+                  <label class="cb-label"><input type="checkbox" name="lang" value="typescript" checked> TypeScript</label>
+                </div>
+              </div>
+              <div class="form-group">
+                <label for="f-repo-limit">Repo Limit (per language)</label>
+                <input type="number" id="f-repo-limit" value="10" min="1" max="100">
+              </div>
+              <div class="form-group">
+                <label for="f-repo-concurrency">Concurrent Repos</label>
+                <input type="number" id="f-repo-concurrency" value="2" min="1" max="8">
+                <p class="form-helper">Higher values scan faster, but they also increase GitHub and Docker load.</p>
+              </div>
+              <div class="form-group">
+                <label for="f-scan-mode">Scan Strategy</label>
+                <select id="f-scan-mode">
+                  <option value="issue-first" selected>Issue-first (Recommended)</option>
+                  <option value="pr-first">PR-first</option>
+                </select>
+                <p class="form-helper">`Issue-first` starts from closed issues already linked to merged PRs, so the matches are usually cleaner.</p>
+              </div>
+              <div class="form-group">
+                <label for="f-pr-limit">PR Limit (per repo)</label>
+                <input type="number" id="f-pr-limit" value="10" min="1" max="100">
+              </div>
+              <div class="form-group">
+                <label for="f-min-stars">Min Stars</label>
+                <input type="number" id="f-min-stars" value="50" min="0">
+              </div>
+              <div class="form-group">
+                <label for="f-target-repo">Single Repo Deep Scan</label>
+                <input type="text" id="f-target-repo" placeholder="owner/name">
+                <p class="form-helper">When you fill this in, the scan skips repo discovery and goes deep on that one repository.</p>
+              </div>
+              <div class="form-group">
+                <label for="f-merged-after">Merged After</label>
+                <input type="date" id="f-merged-after">
+              </div>
+              <div class="form-group">
+                <label class="cb-label"><input type="checkbox" id="f-dry-run"> Dry Run (skip Docker)</label>
+              </div>
+            </div>
+            <button type="submit" class="btn btn-primary" id="scan-submit">🚀 Start Scan</button>
+          </form>
+        </div>
+
+        <!-- Live scan log -->
+        <div class="card" id="scan-log-card" style="display:none;">
+          <h3>Scan Progress <span class="badge badge-pulse" id="scan-running-badge">Running</span></h3>
+          <p class="scan-status-text" id="scan-status-text">Waiting for scan activity...</p>
+          <div id="scan-performance-summary" class="scan-performance" style="display:none;"></div>
+          <pre id="scan-log-output" class="log-output"></pre>
+        </div>
+      </section>
+    </main>
+  </div>
+  <script src="/app.js"></script>
+</body>
+</html>

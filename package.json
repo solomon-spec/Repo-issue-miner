@@ -1,0 +1,27 @@
+{
+  "name": "repo-issue-miner",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "description": "Mine GitHub repos and merged PRs with linked issues, then validate pre-fix snapshots in Docker. Includes web dashboard and SQLite persistence.",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "scan": "node dist/index.js scan",
+    "serve": "node dist/index.js serve",
+    "dev": "npm run build && node dist/index.js"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/express": "^5.0.6",
+    "typescript": "^5.8.3"
+  },
+  "dependencies": {
+    "better-sqlite3": "^12.8.0",
+    "dotenv": "^17.3.1",
+    "express": "^5.2.1"
+  }
+}
