@@ -195,11 +195,3 @@ Rejected entries include the same context plus rejection reasons.
 - This version assumes the repo's Dockerfile is sufficient for pre-fix execution. Multi-service repos with databases or extra infrastructure may still be rejected.
 - Very large repos may need a deep-scan fallback checkout if GitHub's recursive tree API terminates early.
 
-## Good next improvements
-
-- Persist scan state in Postgres instead of JSON files
-- Add GitHub rate-limit handling and backoff
-- Add richer PR scoring using reviews and timeline signals
-- Improve Compose service detection
-- Add HTML report output
-- Add parallel workers
