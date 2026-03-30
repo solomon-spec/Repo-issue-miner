@@ -109,6 +109,7 @@ Minimal `.env` example:
 ```bash
 GITHUB_TOKEN=ghp_your_token_here
 GEMINI_API_KEY=your_gemini_key_here
+HOST=127.0.0.1
 PORT=3000
 SCAN_MODE=issue-first
 ```
@@ -118,6 +119,7 @@ Gemini is optional. Without it, the tool only uses deterministic test-plan infer
 Important env vars:
 - `GITHUB_TOKEN`: strongly recommended for GitHub search and repo metadata
 - `GEMINI_API_KEY`: optional Gemini fallback for Docker-plan inference
+- `HOST`: server bind address. Use `0.0.0.0` to expose the dashboard to your local network
 - `PORT`: dashboard port, default `3000`
 - `SCAN_MODE`: `issue-first` or `pr-first`
 - `TARGET_REPO`: optional default `owner/name` deep-scan target
@@ -142,8 +144,12 @@ http://localhost:3000
 
 Useful commands:
 - `npm run serve`: start the web app
+- `npm run serve:lan`: start the web app on your local network
 - `npm run dev`: rebuild, then start the web app
+- `npm run dev:lan`: rebuild, then start the web app on your local network
 - `npm run scan`: run a CLI scan directly
+
+To expose the app on your LAN, either set `HOST=0.0.0.0` in `.env` or use the LAN scripts above. The startup log will print the detected local-network URLs you can open from another device on the same network.
 
 ## CLI Usage
 
@@ -194,4 +200,3 @@ Rejected entries include the same context plus rejection reasons.
 - Compose service selection is basic in this version. Gemini can help, but the validator still enforces a narrow safe command set.
 - This version assumes the repo's Dockerfile is sufficient for pre-fix execution. Multi-service repos with databases or extra infrastructure may still be rejected.
 - Very large repos may need a deep-scan fallback checkout if GitHub's recursive tree API terminates early.
-

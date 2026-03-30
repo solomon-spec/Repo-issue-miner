@@ -1,3 +1,4 @@
+import { networkInterfaces } from "node:os";
 import { loadConfig } from "./config.js";
 import { runScan } from "./pipeline.js";
 import { createApp } from "./server.js";
@@ -28,18 +29,41 @@ Scan Options:
   --keep-worktree
 
 Server Options:
+  --host 127.0.0.1
   --port 3000
   --db-path ./data/repo-miner.db
 `);
 }
 
+function displayServerUrls(host: string, port: number): string[] {
+  if (host !== "0.0.0.0" && host !== "::") {
+    const displayHost = host === "127.0.0.1" ? "localhost" : host;
+    return [`http://${displayHost}:${port}`];
+  }
+
+  const urls = new Set<string>([`http://localhost:${port}`]);
+  const interfaces = networkInterfaces();
+  for (const entries of Object.values(interfaces)) {
+    for (const entry of entries ?? []) {
+      if (entry.internal || entry.family !== "IPv4") {
+        continue;
+      }
+      urls.add(`http://${entry.address}:${port}`);
+    }
+  }
+  return Array.from(urls);
+}
+
 async function main(): Promise<void> {
-  const [, , command, ...args] = process.argv;
-  if (command === "--help" || command === "-h") {
+  const rawArgs = process.argv.slice(2);
+  const firstArg = rawArgs[0];
+  if (firstArg === "--help" || firstArg === "-h") {
     printUsage();
     return;
   }
 
+  const command = firstArg === "scan" || firstArg === "serve" ? firstArg : undefined;
+  const args = command ? rawArgs.slice(1) : rawArgs;
   const config = loadConfig(args);
 
   if (command === "scan") {
@@ -67,8 +91,12 @@ async function main(): Promise<void> {
 
   // Default: start web server
   const app = createApp(config);
-  app.listen(config.port, () => {
-    console.log(`🚀 repo-issue-miner dashboard running at http://localhost:${config.port}`);
+  app.listen(config.port, config.host, () => {
+    const urls = displayServerUrls(config.host, config.port);
+    console.log("🚀 repo-issue-miner dashboard running at:");
+    for (const url of urls) {
+      console.log(`   ${url}`);
+    }
   });
 }
 

@@ -13,6 +13,7 @@ export interface Config {
   workRoot: string;
   outputRoot: string;
   dbPath: string;
+  host: string;
   port: number;
   minStars: number;
   repoLimit: number;
