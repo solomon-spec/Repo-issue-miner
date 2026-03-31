@@ -334,9 +334,26 @@ export function getStats(db: Database.Database): any {
   const prs = (db.prepare("SELECT COUNT(*) as cnt FROM pull_requests").get() as any).cnt;
   const issues = (db.prepare("SELECT COUNT(*) as cnt FROM issues").get() as any).cnt;
   const scans = (db.prepare("SELECT COUNT(*) as cnt FROM scans").get() as any).cnt;
-  const accepted = (db.prepare("SELECT COUNT(*) as cnt FROM scan_candidates WHERE accepted = 1").get() as any).cnt;
-  const rejected = (db.prepare("SELECT COUNT(*) as cnt FROM scan_candidates WHERE accepted = 0").get() as any).cnt;
-  const testsUnableToRun = (db.prepare("SELECT COUNT(*) as cnt FROM scan_candidates WHERE tests_unable_to_run = 1").get() as any).cnt;
+  const dedupedCandidateStats = db.prepare(`
+    WITH ranked_candidates AS (
+      SELECT
+        sc.*,
+        ROW_NUMBER() OVER (
+          PARTITION BY sc.repo_id, COALESCE(sc.pr_id, -sc.id)
+          ORDER BY sc.id DESC
+        ) AS row_rank
+      FROM scan_candidates sc
+    )
+    SELECT
+      COALESCE(SUM(CASE WHEN accepted = 1 THEN 1 ELSE 0 END), 0) as accepted,
+      COALESCE(SUM(CASE WHEN accepted = 0 THEN 1 ELSE 0 END), 0) as rejected,
+      COALESCE(SUM(CASE WHEN tests_unable_to_run = 1 THEN 1 ELSE 0 END), 0) as tests_unable_to_run
+    FROM ranked_candidates
+    WHERE row_rank = 1
+  `).get() as { accepted: number; rejected: number; tests_unable_to_run: number };
+  const accepted = dedupedCandidateStats.accepted;
+  const rejected = dedupedCandidateStats.rejected;
+  const testsUnableToRun = dedupedCandidateStats.tests_unable_to_run;
   const lastScan = db.prepare("SELECT * FROM scans ORDER BY started_at DESC LIMIT 1").get();
   return { repos, prs, issues, scans, accepted, rejected, testsUnableToRun, lastScan };
 }
@@ -392,21 +409,35 @@ export function getAcceptedCandidates(
     || opts.reviewStatus === "new"
     ? opts.reviewStatus
     : "all";
-  const where = [
-    "sc.accepted = 1",
-    reviewStatus === "all"
-      ? ""
-      : "COALESCE(NULLIF(json_extract(sc.details_json, '$.reviewQueue.status'), ''), 'new') = @reviewStatus",
-  ].filter(Boolean).join(" AND ");
   const params = {
     reviewStatus,
     limit,
     offset,
   };
-  const total = (db.prepare(`SELECT COUNT(*) as cnt FROM scan_candidates sc WHERE ${where}`).get(params) as any).cnt;
+  const rankedCandidatesCte = `
+    WITH ranked_candidates AS (
+      SELECT
+        sc.*,
+        ROW_NUMBER() OVER (
+          PARTITION BY sc.repo_id, COALESCE(sc.pr_id, -sc.id)
+          ORDER BY sc.id DESC
+        ) AS row_rank
+      FROM scan_candidates sc
+    )
+  `;
+  const rankedWhere = [
+    "rc.row_rank = 1",
+    "rc.accepted = 1",
+    reviewStatus === "all"
+      ? ""
+      : "COALESCE(NULLIF(json_extract(rc.details_json, '$.reviewQueue.status'), ''), 'new') = @reviewStatus",
+  ].filter(Boolean).join(" AND ");
+
+  const total = (db.prepare(`${rankedCandidatesCte} SELECT COUNT(*) as cnt FROM ranked_candidates rc WHERE ${rankedWhere}`).get(params) as any).cnt;
   const rows = db.prepare(`
+    ${rankedCandidatesCte}
     SELECT
-      sc.*,
+      rc.*,
       s.id as scan_id,
       s.status as scan_status,
       s.started_at as scan_started_at,
@@ -418,12 +449,12 @@ export function getAcceptedCandidates(
       pr.title as pr_title,
       pr.url as pr_url,
       pr.merged_at as pr_merged_at
-    FROM scan_candidates sc
-    JOIN scans s ON s.id = sc.scan_id
-    JOIN repos r ON r.id = sc.repo_id
-    LEFT JOIN pull_requests pr ON pr.id = sc.pr_id
-    WHERE ${where}
-    ORDER BY sc.created_at DESC
+    FROM ranked_candidates rc
+    JOIN scans s ON s.id = rc.scan_id
+    JOIN repos r ON r.id = rc.repo_id
+    LEFT JOIN pull_requests pr ON pr.id = rc.pr_id
+    WHERE ${rankedWhere}
+    ORDER BY rc.created_at DESC, rc.id DESC
     LIMIT @limit OFFSET @offset
   `).all(params);
   return { rows, total };

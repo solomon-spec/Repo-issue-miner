@@ -32,6 +32,10 @@ type RepoSearchNode = RepoSearchResponse["search"]["nodes"][number];
 
 interface PrSearchResponse {
   search: {
+    pageInfo: {
+      hasNextPage: boolean;
+      endCursor?: string | null;
+    };
     nodes: Array<{
       __typename: "PullRequest";
       number: number;
@@ -60,6 +64,10 @@ interface PrSearchResponse {
 
 interface IssueSearchResponse {
   search: {
+    pageInfo: {
+      hasNextPage: boolean;
+      endCursor?: string | null;
+    };
     nodes: Array<{
       __typename: "Issue";
       number: number;
@@ -340,10 +348,35 @@ export class GitHubClient {
     } satisfies SearchRepo;
   }
 
+  private mapGitHubLinkedIssue(issue: {
+    number: number;
+    title?: string | null;
+    body?: string | null;
+    state?: string | null;
+    url?: string | null;
+    repository: { nameWithOwner: string };
+  }): IssueRef {
+    const [owner, name] = issue.repository.nameWithOwner.split("/");
+    return {
+      owner,
+      repo: name,
+      number: issue.number,
+      url: issue.url ?? undefined,
+      title: issue.title ?? undefined,
+      body: issue.body ?? undefined,
+      state: issue.state ?? undefined,
+      linkType: "github_linked",
+    };
+  }
+
   async searchMergedPullRequests(repo: SearchRepo, limit: number, mergedAfter?: string): Promise<PullRequestSummary[]> {
     const query = `
-      query SearchMergedPrs($query: String!, $limit: Int!) {
-        search(type: ISSUE, query: $query, first: $limit) {
+      query SearchMergedPrs($query: String!, $limit: Int!, $after: String) {
+        search(type: ISSUE, query: $query, first: $limit, after: $after) {
+          pageInfo {
+            hasNextPage
+            endCursor
+          }
           nodes {
             __typename
             ... on PullRequest {
@@ -387,42 +420,39 @@ export class GitHubClient {
       [...baseParts, "label:bug"].join(" "),
       [...baseParts, "label:regression"].join(" "),
       [...baseParts, "label:fix"].join(" "),
+      baseParts.join(" "),
     ];
 
     const merged = new Map<number, PullRequestSummary>();
     for (const searchQuery of searchQueries) {
       if (merged.size >= limit) break;
-      const data = await this.graphql<PrSearchResponse>(query, { query: searchQuery, limit });
-      for (const node of data.search.nodes.filter((item) => item.__typename === "PullRequest")) {
-        if (merged.has(node.number)) continue;
-        merged.set(node.number, {
-          number: node.number,
-          url: node.url,
-          title: node.title,
-          body: node.bodyText,
-          mergedAt: node.mergedAt,
-          changedFilesCount: node.changedFiles,
-          labels: node.labels.nodes.map((label) => label.name),
-          baseRefName: node.baseRefName,
-          baseRefOid: node.baseRefOid,
-          headRefOid: node.headRefOid,
-          linkedIssues: node.closingIssuesReferences.nodes.map((issue) => {
-            const [owner, name] = issue.repository.nameWithOwner.split("/");
-            return {
-              owner,
-              repo: name,
-              number: issue.number,
-              url: issue.url ?? undefined,
-              title: issue.title ?? undefined,
-              body: issue.body ?? undefined,
-              state: issue.state ?? undefined,
-              linkType: "github_linked" as const,
-            };
-          }),
-        });
-        if (merged.size >= limit) break;
+      let after: string | null = null;
+      while (merged.size < limit) {
+        const pageLimit = Math.min(Math.max(limit - merged.size, 1), 100);
+        const data: PrSearchResponse = await this.graphql<PrSearchResponse>(query, { query: searchQuery, limit: pageLimit, after });
+        for (const node of data.search.nodes.filter((item: PrSearchResponse["search"]["nodes"][number]) => item.__typename === "PullRequest")) {
+          if (merged.has(node.number)) continue;
+          merged.set(node.number, {
+            number: node.number,
+            url: node.url,
+            title: node.title,
+            body: node.bodyText,
+            mergedAt: node.mergedAt,
+            changedFilesCount: node.changedFiles,
+            labels: node.labels.nodes.map((label: { name: string }) => label.name),
+            baseRefName: node.baseRefName,
+            baseRefOid: node.baseRefOid,
+            headRefOid: node.headRefOid,
+            linkedIssues: node.closingIssuesReferences.nodes.map((issue) => this.mapGitHubLinkedIssue(issue)),
+          });
+          if (merged.size >= limit) break;
+        }
+
+        if (!data.search.pageInfo.hasNextPage || !data.search.pageInfo.endCursor) {
+          break;
+        }
+        after = data.search.pageInfo.endCursor;
       }
-      if (merged.size > 0) break;
     }
 
     return [...merged.values()];
@@ -433,9 +463,38 @@ export class GitHubClient {
     limit: number,
     mergedAfter?: string,
   ): Promise<PullRequestSummary[]> {
+    return this.searchClosedIssuesWithMergedPullRequestsInternal(repo, {
+      limit,
+      mergedAfter,
+      exhaustive: false,
+    });
+  }
+
+  async searchAllClosedIssuesWithMergedPullRequests(
+    repo: SearchRepo,
+    mergedAfter?: string,
+  ): Promise<PullRequestSummary[]> {
+    return this.searchClosedIssuesWithMergedPullRequestsInternal(repo, {
+      mergedAfter,
+      exhaustive: true,
+    });
+  }
+
+  private async searchClosedIssuesWithMergedPullRequestsInternal(
+    repo: SearchRepo,
+    opts: {
+      limit?: number;
+      mergedAfter?: string;
+      exhaustive: boolean;
+    },
+  ): Promise<PullRequestSummary[]> {
     const query = `
-      query SearchClosedIssues($query: String!, $limit: Int!) {
-        search(type: ISSUE, query: $query, first: $limit) {
+      query SearchClosedIssues($query: String!, $limit: Int!, $after: String) {
+        search(type: ISSUE, query: $query, first: $limit, after: $after) {
+          pageInfo {
+            hasNextPage
+            endCursor
+          }
           nodes {
             __typename
             ... on Issue {
@@ -466,7 +525,8 @@ export class GitHubClient {
       }
     `;
 
-    const issueSearchLimit = Math.min(Math.max(limit * 4, limit), 100);
+    const mergedAfter = opts.mergedAfter;
+    const limit = opts.limit;
     const baseParts = [
       `repo:${repo.fullName}`,
       "is:issue",
@@ -476,64 +536,83 @@ export class GitHubClient {
       "sort:updated-desc",
     ].filter(Boolean);
 
-    const searchQueries = [
-      [...baseParts, "in:title,body", "(bug OR fix OR regression OR failure OR crash OR error)"].join(" "),
-      [...baseParts, "label:bug"].join(" "),
-      [...baseParts, "label:regression"].join(" "),
-      [...baseParts, "label:fix"].join(" "),
-    ];
+    const searchQueries = opts.exhaustive
+      ? [baseParts.join(" ")]
+      : [
+        [...baseParts, "in:title,body", "(bug OR fix OR regression OR failure OR crash OR error)"].join(" "),
+        [...baseParts, "label:bug"].join(" "),
+        [...baseParts, "label:regression"].join(" "),
+        [...baseParts, "label:fix"].join(" "),
+        baseParts.join(" "),
+      ];
 
     const merged = new Map<number, PullRequestSummary>();
     for (const searchQuery of searchQueries) {
-      if (merged.size >= limit) break;
-      const data = await this.graphql<IssueSearchResponse>(query, { query: searchQuery, limit: issueSearchLimit });
-      for (const issueNode of data.search.nodes.filter((item) => item.__typename === "Issue")) {
-        const [issueOwner, issueRepo] = issueNode.repository.nameWithOwner.split("/");
-        const linkedIssue: IssueRef = {
-          owner: issueOwner,
-          repo: issueRepo,
-          number: issueNode.number,
-          url: issueNode.url,
-          title: issueNode.title,
-          body: issueNode.bodyText,
-          state: issueNode.state,
-          linkType: "github_linked",
-        };
+      if (!opts.exhaustive && typeof limit === "number" && merged.size >= limit) break;
+      let after: string | null = null;
 
-        for (const prNode of issueNode.closedByPullRequestsReferences.nodes) {
-          if (!prNode.mergedAt) continue;
-          if (mergedAfter && prNode.mergedAt < mergedAfter) continue;
+      while (true) {
+        const pageLimit = opts.exhaustive
+          ? 100
+          : Math.min(Math.max(limit ?? 1, 1), 100);
+        const data: IssueSearchResponse = await this.graphql<IssueSearchResponse>(query, { query: searchQuery, limit: pageLimit, after });
+        for (const issueNode of data.search.nodes.filter((item: IssueSearchResponse["search"]["nodes"][number]) => item.__typename === "Issue")) {
+          const [issueOwner, issueRepo] = issueNode.repository.nameWithOwner.split("/");
+          const linkedIssue: IssueRef = {
+            owner: issueOwner,
+            repo: issueRepo,
+            number: issueNode.number,
+            url: issueNode.url,
+            title: issueNode.title,
+            body: issueNode.bodyText,
+            state: issueNode.state,
+            linkType: "github_linked",
+          };
 
-          const existing = merged.get(prNode.number);
-          if (existing) {
-            const linkedIssues = existing.linkedIssues ?? [];
-            const key = `${linkedIssue.owner}/${linkedIssue.repo}#${linkedIssue.number}`;
-            if (!linkedIssues.some((issue) => `${issue.owner}/${issue.repo}#${issue.number}` === key)) {
-              linkedIssues.push(linkedIssue);
+          for (const prNode of issueNode.closedByPullRequestsReferences.nodes) {
+            if (!prNode.mergedAt) continue;
+            if (mergedAfter && prNode.mergedAt < mergedAfter) continue;
+
+            const existing = merged.get(prNode.number);
+            if (existing) {
+              const linkedIssues = existing.linkedIssues ?? [];
+              const key = `${linkedIssue.owner}/${linkedIssue.repo}#${linkedIssue.number}`;
+              if (!linkedIssues.some((issue) => `${issue.owner}/${issue.repo}#${issue.number}` === key)) {
+                linkedIssues.push(linkedIssue);
+              }
+              continue;
             }
-            continue;
-          }
 
-          merged.set(prNode.number, {
-            number: prNode.number,
-            url: prNode.url,
-            title: prNode.title,
-            body: prNode.bodyText,
-            mergedAt: prNode.mergedAt,
-            changedFilesCount: prNode.changedFiles,
-            labels: prNode.labels.nodes.map((label) => label.name),
-            baseRefName: prNode.baseRefName,
-            baseRefOid: prNode.baseRefOid,
-            headRefOid: prNode.headRefOid,
-            linkedIssues: [linkedIssue],
-          });
-          if (merged.size >= limit) break;
+            merged.set(prNode.number, {
+              number: prNode.number,
+              url: prNode.url,
+              title: prNode.title,
+              body: prNode.bodyText,
+              mergedAt: prNode.mergedAt,
+              changedFilesCount: prNode.changedFiles,
+              labels: prNode.labels.nodes.map((label: { name: string }) => label.name),
+              baseRefName: prNode.baseRefName,
+              baseRefOid: prNode.baseRefOid,
+              headRefOid: prNode.headRefOid,
+              linkedIssues: [linkedIssue],
+            });
+            if (!opts.exhaustive && typeof limit === "number" && merged.size >= limit) break;
+          }
+          if (!opts.exhaustive && typeof limit === "number" && merged.size >= limit) break;
         }
-        if (merged.size >= limit) break;
+
+        if ((!opts.exhaustive && typeof limit === "number" && merged.size >= limit)
+          || !data.search.pageInfo.hasNextPage
+          || !data.search.pageInfo.endCursor) {
+          break;
+        }
+        after = data.search.pageInfo.endCursor;
       }
     }
 
-    return [...merged.values()];
+    return typeof limit === "number"
+      ? [...merged.values()].slice(0, limit)
+      : [...merged.values()];
   }
 
   async listPullRequestFiles(repo: SearchRepo, prNumber: number): Promise<PullRequestFile[]> {

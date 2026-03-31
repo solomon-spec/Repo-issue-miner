@@ -294,6 +294,8 @@ export async function runScan(
   let totalReposDiscovered = 0;
   let totalReposProcessed = 0;
   let totalPullRequestsAnalyzed = 0;
+  const scheduledRepoFullNames = new Set<string>();
+  const normalizedTargetRepo = config.targetRepo?.toLowerCase();
 
   const progress = (message: string): void => {
     onProgress?.(message);
@@ -303,7 +305,7 @@ export async function runScan(
   const scanId = createScan(db, JSON.stringify(safeConfig));
   progress(`Scan #${scanId} started`);
   progress(
-    `Config: languages=${config.languages.join(", ")}, scanMode=${config.scanMode}, repoLimit=${config.repoLimit}, repoConcurrency=${config.repoConcurrency}, prLimit=${config.prLimit}, minStars=${config.minStars}${config.targetRepo ? `, targetRepo=${config.targetRepo}` : ""}${config.mergedAfter ? `, mergedAfter=${config.mergedAfter}` : ""}${config.dryRun ? ", dryRun=true" : ""}`,
+    `Config: languages=${config.languages.join(", ")}, scanMode=${config.targetRepo ? "deep-scan(issue-first exhaustive)" : config.scanMode}, repoLimit=${config.repoLimit}, repoConcurrency=${config.repoConcurrency}, prLimit=${config.targetRepo ? "all linked issues" : config.prLimit}, minStars=${config.minStars}${config.targetRepo ? `, targetRepo=${config.targetRepo}` : ""}${config.mergedAfter ? `, mergedAfter=${config.mergedAfter}` : ""}${config.dryRun ? ", dryRun=true" : ""}`,
   );
 
   const processRepo = async (
@@ -333,7 +335,7 @@ export async function runScan(
       progress(`Fetched repo tree and README for ${repo.fullName} in ${formatDuration(r.timing.durationMs)}`);
     } catch (err) {
       const repoFetchError = err instanceof Error ? err.message : String(err);
-      if (config.targetRepo && repo.fullName === config.targetRepo) {
+      if (normalizedTargetRepo && repo.fullName.toLowerCase() === normalizedTargetRepo) {
         progress(`GitHub tree fetch failed for ${repo.fullName} (${repoFetchError}); falling back to a temporary checkout for deep scan...`);
         let fallbackSnapshot: Awaited<ReturnType<typeof prepareSnapshot>> | undefined;
         try {
@@ -398,26 +400,35 @@ export async function runScan(
     }
 
     let prs: Awaited<ReturnType<typeof github.searchMergedPullRequests>>;
-    const searchStep = config.scanMode === "issue-first" ? "issue_search" : "pr_search";
+    const exhaustiveIssueScan = Boolean(normalizedTargetRepo && repo.fullName.toLowerCase() === normalizedTargetRepo);
+    const searchStep = exhaustiveIssueScan
+      ? "issue_search_full"
+      : (config.scanMode === "issue-first" ? "issue_search" : "pr_search");
     try {
       const r = await timeStep(
         searchStep,
         timingsForRepo,
-        () => config.scanMode === "issue-first"
-          ? github.searchClosedIssuesWithMergedPullRequests(repo, config.prLimit, config.mergedAfter)
-          : github.searchMergedPullRequests(repo, config.prLimit, config.mergedAfter),
+        () => exhaustiveIssueScan
+          ? github.searchAllClosedIssuesWithMergedPullRequests(repo, config.mergedAfter)
+          : (config.scanMode === "issue-first"
+            ? github.searchClosedIssuesWithMergedPullRequests(repo, config.prLimit, config.mergedAfter)
+            : github.searchMergedPullRequests(repo, config.prLimit, config.mergedAfter)),
         scanTimings,
       );
       prs = r.result;
       progress(
-        config.scanMode === "issue-first"
-          ? `Found ${prs.length} PRs from closed linked issues in ${repo.fullName} in ${formatDuration(r.timing.durationMs)}`
-          : `Found ${prs.length} merged PR candidates in ${repo.fullName} in ${formatDuration(r.timing.durationMs)}`,
+        exhaustiveIssueScan
+          ? `Found ${prs.length} PRs from all closed linked issues in ${repo.fullName} in ${formatDuration(r.timing.durationMs)}`
+          : (config.scanMode === "issue-first"
+            ? `Found ${prs.length} PRs from closed linked issues in ${repo.fullName} in ${formatDuration(r.timing.durationMs)}`
+            : `Found ${prs.length} merged PR candidates in ${repo.fullName} in ${formatDuration(r.timing.durationMs)}`),
       );
     } catch (err) {
-      const reason = config.scanMode === "issue-first"
-        ? "failed to search closed issues with linked PRs"
-        : "failed to search merged PRs";
+      const reason = exhaustiveIssueScan
+        ? "failed to search all closed issues with linked PRs"
+        : (config.scanMode === "issue-first"
+          ? "failed to search closed issues with linked PRs"
+          : "failed to search merged PRs");
       progress(`Rejected ${repo.fullName}: ${reason} (${err instanceof Error ? err.message : String(err)})`);
       const rej = makeRejectedCandidate(repo, reason);
       rej.timings = [...timingsForRepo];
@@ -651,16 +662,28 @@ export async function runScan(
           scanTimings,
           () => github.searchRepositories(language, config.repoLimit, config.minStars),
         );
-        totalReposDiscovered += repos.length;
-        progress(`[${language}] Found ${repos.length} repositories in ${formatDuration(repoSearchTiming.durationMs)}`);
-        if (repos.length > 0) {
+        const uniqueRepos = repos.filter((repo) => {
+          if (scheduledRepoFullNames.has(repo.fullName)) {
+            return false;
+          }
+          scheduledRepoFullNames.add(repo.fullName);
+          return true;
+        });
+        totalReposDiscovered += uniqueRepos.length;
+        const duplicateRepoCount = repos.length - uniqueRepos.length;
+        progress(
+          duplicateRepoCount > 0
+            ? `[${language}] Found ${repos.length} repositories in ${formatDuration(repoSearchTiming.durationMs)} (${uniqueRepos.length} unique after cross-language dedupe)`
+            : `[${language}] Found ${repos.length} repositories in ${formatDuration(repoSearchTiming.durationMs)}`,
+        );
+        if (uniqueRepos.length > 0) {
           progress(`[${language}] Processing repositories with concurrency ${config.repoConcurrency}...`);
         }
         await runWithConcurrency(
-          repos,
+          uniqueRepos,
           config.repoConcurrency,
           async (repo, repoIndex) => {
-            await processRepo(repo, [language], `[${language}]`, `Repo ${repoIndex + 1}/${repos.length}`);
+            await processRepo(repo, [language], `[${language}]`, `Repo ${repoIndex + 1}/${uniqueRepos.length}`);
           },
         );
       }

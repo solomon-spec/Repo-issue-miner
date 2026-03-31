@@ -255,10 +255,7 @@
     $("#f-repo-limit").value = "1";
     $("#f-repo-concurrency").value = "1";
     $("#f-min-stars").value = "0";
-    const currentPrLimit = Number($("#f-pr-limit").value) || 10;
-    if (currentPrLimit < 25) {
-      $("#f-pr-limit").value = "25";
-    }
+    $("#f-pr-limit").value = "100";
   }
 
   /* ---- Dashboard ---- */
@@ -527,6 +524,7 @@
   let acceptedReviewFilter = "all";
   let acceptedTestRunPoller = null;
   const activeAcceptedTestRuns = new Set();
+  const expandedAcceptedRows = new Set();
 
   function manualReproUsage(details) {
     const state = details?.manualRepro || {};
@@ -837,6 +835,10 @@
         const manualReview = manualReviewState(details);
         const dockerTest = acceptedDockerTestState(details);
         const activeTestRun = row.activeTestRun || null;
+        if (activeTestRun?.status === "running") {
+          expandedAcceptedRows.add(String(row.id));
+        }
+        const expanded = expandedAcceptedRows.has(String(row.id));
         const reasons = Array.isArray(row.rejection_reasons) ? row.rejection_reasons : [];
         const manualRepro = buildManualReproText({
           repoFullName: row.repo_full_name,
@@ -855,21 +857,44 @@
 
         return `
           <div class="card accepted-card">
-            <div class="accepted-card-header">
-              <div class="accepted-card-title">
-                <strong>${esc(row.repo_full_name)}</strong>
-                <span class="badge badge-accepted">Accepted</span>
-                <a href="${esc(row.pr_url || "#")}" target="_blank" class="repo-link">PR #${row.pr_number || "—"}</a>
-                <span class="badge ${usage.used ? "badge-completed" : "badge-warn"}">${usage.used ? "Manual Repro Used" : "Manual Repro Unused"}</span>
-                ${reviewStatusBadge(review.status)}
-                ${manualReview.rejected ? '<span class="badge badge-rejected">Manual Reject</span>' : ""}
+            <div class="accepted-card-header accepted-card-header-compact">
+              <div class="accepted-card-summary">
+                <div class="accepted-card-summary-main">
+                  <strong>${esc(row.repo_full_name)}</strong>
+                  <a href="${esc(row.pr_url || "#")}" target="_blank" class="repo-link">PR #${row.pr_number || "—"}</a>
+                  ${reviewStatusBadge(review.status)}
+                  ${acceptedDockerRunBadge(activeTestRun, dockerTest)}
+                  <span class="badge ${usage.used ? "badge-completed" : "badge-warn"}">${usage.used ? "Manual Repro Used" : "Manual Repro Unused"}</span>
+                  ${manualReview.rejected ? '<span class="badge badge-rejected">Manual Reject</span>' : ""}
+                </div>
+                <div class="accepted-card-summary-sub">
+                  <span>${row.pr_title ? esc(row.pr_title) : "No PR title saved"}</span>
+                  <span>${Array.isArray(row.issues) ? row.issues.length : 0} issue${Array.isArray(row.issues) && row.issues.length === 1 ? "" : "s"}</span>
+                  <span>${dockerTest.dockerfile.path ? `Dockerfile: ${esc(dockerTest.dockerfile.path)}` : "Dockerfile: —"}</span>
+                  <span>${activeTestRun?.status === "running"
+                    ? "Docker tests running"
+                    : (dockerTest.lastRun.finishedAt
+                      ? `${dockerTest.lastRun.success ? "Docker tests passed" : "Docker tests failed"} ${fmtDate(dockerTest.lastRun.finishedAt)}`
+                      : "Docker tests not run")}</span>
+                </div>
               </div>
               <div class="accepted-card-actions">
                 <button type="button" class="btn btn-sm btn-info" data-deep-scan-accepted="${esc(row.repo_full_name)}">Deep Scan Repo</button>
-                <button type="button" class="btn btn-sm" data-toggle-manual-repro-used="${row.id}" data-used="${usage.used ? "1" : "0"}">${usage.used ? "Mark Unused" : "Mark Used"}</button>
-                <button type="button" class="btn btn-sm btn-danger" data-manual-reject="${row.id}" ${manualReview.rejected ? "disabled" : ""}>${manualReview.rejected ? "Marked Rejected" : "Reject"}</button>
+                <button type="button" class="btn btn-sm" data-toggle-accepted-details="${row.id}" aria-expanded="${expanded ? "true" : "false"}">${expanded ? "Hide Details" : "View Details"}</button>
               </div>
             </div>
+            <div class="accepted-card-body" data-accepted-details="${row.id}" ${expanded ? "" : "hidden"}>
+              <div class="accepted-card-header">
+                <div class="accepted-card-title">
+                  <span class="badge badge-accepted">Accepted</span>
+                  <span class="badge badge-info">Scan #${row.scan_id}</span>
+                  <span class="badge badge-info">${esc(acceptedDockerfileSourceLabel(dockerTest.dockerfile.source))}</span>
+                </div>
+                <div class="accepted-card-actions">
+                  <button type="button" class="btn btn-sm" data-toggle-manual-repro-used="${row.id}" data-used="${usage.used ? "1" : "0"}">${usage.used ? "Mark Unused" : "Mark Used"}</button>
+                  <button type="button" class="btn btn-sm btn-danger" data-manual-reject="${row.id}" ${manualReview.rejected ? "disabled" : ""}>${manualReview.rejected ? "Marked Rejected" : "Reject"}</button>
+                </div>
+              </div>
             ${row.pr_title ? `<p class="accepted-pr-title">${esc(row.pr_title)}</p>` : ""}
             <dl class="detail-kv accepted-meta">
               <dt>Repo</dt><dd><a href="${esc(row.repo_url || "#")}" target="_blank" class="repo-link">${esc(row.repo_full_name)}</a></dd>
@@ -956,6 +981,7 @@
             ${manualReview.rejected ? `<p class="accepted-reasons">${esc(manualReview.reason || "manually rejected by user")}</p>` : ""}
             ${reasons.length ? `<p class="accepted-reasons">${esc(reasons.join(" · "))}</p>` : ""}
             ${manualRepro ? renderManualReproBlock(`accepted-${row.id}`, manualRepro) : ""}
+            </div>
           </div>
         `;
       }).join("");
@@ -1026,6 +1052,23 @@
       $$("[data-deep-scan-accepted]", container).forEach((button) => {
         button.addEventListener("click", () => {
           prepareSingleRepoDeepScan(button.dataset.deepScanAccepted);
+        });
+      });
+
+      $$("[data-toggle-accepted-details]", container).forEach((button) => {
+        button.addEventListener("click", () => {
+          const candidateId = button.dataset.toggleAcceptedDetails;
+          const detailsPanel = $(`[data-accepted-details="${candidateId}"]`, container);
+          if (!candidateId || !detailsPanel) return;
+          const nextExpanded = detailsPanel.hidden;
+          detailsPanel.hidden = !nextExpanded;
+          if (nextExpanded) {
+            expandedAcceptedRows.add(String(candidateId));
+          } else {
+            expandedAcceptedRows.delete(String(candidateId));
+          }
+          button.textContent = nextExpanded ? "Hide Details" : "View Details";
+          button.setAttribute("aria-expanded", nextExpanded ? "true" : "false");
         });
       });
 

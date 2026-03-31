@@ -508,6 +508,34 @@ tbody tr:hover { background: var(--bg-hover); }
   margin-bottom: 1rem;
 }
 
+.accepted-card-body {
+  padding-top: 0.35rem;
+}
+
+.accepted-card-header-compact {
+  margin-bottom: 0;
+}
+
+.accepted-card-summary {
+  display: grid;
+  gap: 0.35rem;
+  min-width: 0;
+  flex: 1;
+}
+
+.accepted-card-summary-main,
+.accepted-card-summary-sub {
+  display: flex;
+  gap: 0.45rem;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.accepted-card-summary-sub {
+  color: var(--text-secondary);
+  font-size: 0.8rem;
+}
+
 .accepted-card-header {
   display: flex;
   gap: 0.75rem;

@@ -166,6 +166,7 @@
               <div class="form-group">
                 <label for="f-pr-limit">PR Limit (per repo)</label>
                 <input type="number" id="f-pr-limit" value="10" min="1" max="100">
+                <p class="form-helper">Normal scans stop at this many candidates per repo. Single-repo deep scan ignores the cap and walks all closed linked issues.</p>
               </div>
               <div class="form-group">
                 <label for="f-min-stars">Min Stars</label>
@@ -174,7 +175,7 @@
               <div class="form-group">
                 <label for="f-target-repo">Single Repo Deep Scan</label>
                 <input type="text" id="f-target-repo" placeholder="owner/name">
-                <p class="form-helper">When you fill this in, the scan skips repo discovery and goes deep on that one repository.</p>
+                <p class="form-helper">When you fill this in, the scan skips repo discovery and exhaustively walks that repo’s closed issues that are linked to merged PRs.</p>
               </div>
               <div class="form-group">
                 <label for="f-merged-after">Merged After</label>
