@@ -150,14 +150,55 @@ export function getRepos(db: Database.Database, opts: { search?: string; limit?:
   const offset = opts.offset ?? 0;
   const where = opts.search ? "WHERE r.full_name LIKE @search OR r.description LIKE @search" : "";
   const params: any = opts.search ? { search: `%${opts.search}%` } : {};
+  const candidateSummaryCte = `
+    WITH latest_candidates AS (
+      SELECT
+        sc.*,
+        ROW_NUMBER() OVER (
+          PARTITION BY sc.repo_id, COALESCE(sc.pr_id, -sc.id)
+          ORDER BY sc.id DESC
+        ) AS row_rank
+      FROM scan_candidates sc
+    ),
+    single_issue_candidates AS (
+      SELECT
+        lc.id AS candidate_id,
+        lc.repo_id,
+        lc.pr_id,
+        MIN(i.owner) AS issue_owner,
+        MIN(i.repo) AS issue_repo,
+        MIN(i.number) AS issue_number
+      FROM latest_candidates lc
+      JOIN issues i ON i.pr_id = lc.pr_id
+      WHERE lc.row_rank = 1
+        AND COALESCE(json_extract(lc.details_json, '$.analysis.accepted'), 0) = 1
+      GROUP BY lc.id, lc.repo_id, lc.pr_id
+      HAVING COUNT(*) = 1
+    ),
+    qualified_candidates AS (
+      SELECT
+        sic.candidate_id,
+        sic.repo_id,
+        sic.pr_id
+      FROM single_issue_candidates sic
+      WHERE (
+        SELECT COUNT(DISTINCT i2.pr_id)
+        FROM issues i2
+        WHERE i2.owner = sic.issue_owner
+          AND i2.repo = sic.issue_repo
+          AND i2.number = sic.issue_number
+      ) = 1
+    )
+  `;
 
   const total = (db.prepare(`SELECT COUNT(*) as cnt FROM repos r ${where}`).get(params) as any).cnt;
   const rows = db.prepare(`
+    ${candidateSummaryCte}
     SELECT r.*,
-      (SELECT COUNT(*) FROM scan_candidates sc WHERE sc.repo_id = r.id AND sc.accepted = 1) as accepted_count,
-      (SELECT COUNT(*) FROM scan_candidates sc WHERE sc.repo_id = r.id AND sc.accepted = 0) as rejected_count,
-      (SELECT COUNT(*) FROM pull_requests pr WHERE pr.repo_id = r.id) as pr_count,
-      (SELECT COUNT(DISTINCT i.id) FROM issues i JOIN pull_requests pr ON pr.id = i.pr_id WHERE pr.repo_id = r.id) as issue_count
+      (SELECT COUNT(*) FROM latest_candidates lc WHERE lc.repo_id = r.id AND lc.row_rank = 1 AND lc.accepted = 1) as accepted_count,
+      (SELECT COUNT(*) FROM latest_candidates lc WHERE lc.repo_id = r.id AND lc.row_rank = 1 AND lc.accepted = 0) as rejected_count,
+      (SELECT COUNT(*) FROM qualified_candidates qc WHERE qc.repo_id = r.id) as pr_count,
+      (SELECT COUNT(*) FROM qualified_candidates qc WHERE qc.repo_id = r.id) as issue_count
     FROM repos r ${where}
     ORDER BY r.updated_at DESC
     LIMIT ${limit} OFFSET ${offset}

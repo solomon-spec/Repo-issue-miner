@@ -197,6 +197,26 @@ async function verifyIssueLinks(
   });
 }
 
+function issueKey(issue: IssueRef): string {
+  return `${issue.owner}/${issue.repo}#${issue.number}`;
+}
+
+function buildIssueToPullRequestMap(prs: Array<{ number: number; linkedIssues?: IssueRef[] }>): Map<string, Set<number>> {
+  const issueToPrNumbers = new Map<string, Set<number>>();
+  for (const pr of prs) {
+    for (const issue of pr.linkedIssues ?? []) {
+      if ((issue.state ?? "").toLowerCase() !== "closed") {
+        continue;
+      }
+      const key = issueKey(issue);
+      const current = issueToPrNumbers.get(key) ?? new Set<number>();
+      current.add(pr.number);
+      issueToPrNumbers.set(key, current);
+    }
+  }
+  return issueToPrNumbers;
+}
+
 /* ------------------------------------------------------------------ */
 /* Rejected candidate helper                                           */
 /* ------------------------------------------------------------------ */
@@ -233,6 +253,7 @@ function makeRejectedCandidate(repo: SearchRepo, message: string): CandidateRepo
       relevantTestFiles: [],
       touchedDirectories: [],
       ignoredFiles: [],
+      codeLinesChanged: 0,
       nonTrivialScore: 0,
       nonTrivialReasons: [message],
       accepted: false,
@@ -305,7 +326,7 @@ export async function runScan(
   const scanId = createScan(db, JSON.stringify(safeConfig));
   progress(`Scan #${scanId} started`);
   progress(
-    `Config: languages=${config.languages.join(", ")}, scanMode=${config.targetRepo ? "deep-scan(issue-first exhaustive)" : config.scanMode}, repoLimit=${config.repoLimit}, repoConcurrency=${config.repoConcurrency}, prLimit=${config.targetRepo ? "all linked issues" : config.prLimit}, minStars=${config.minStars}${config.targetRepo ? `, targetRepo=${config.targetRepo}` : ""}${config.mergedAfter ? `, mergedAfter=${config.mergedAfter}` : ""}${config.dryRun ? ", dryRun=true" : ""}`,
+    `Config: languages=${config.languages.join(", ")}, scanMode=${config.targetRepo ? "deep-scan(issue-first exhaustive)" : config.scanMode}, repoLimit=${config.repoLimit}, repoConcurrency=${config.repoConcurrency}, prLimit=${config.targetRepo ? "all linked issues" : config.prLimit}, minStars=${config.minStars}${config.targetRepo ? `, targetRepo=${config.targetRepo}` : ""}${config.targetRepo ? (config.mergedAfter ? ", mergedAfter=ignored for deep scan" : "") : (config.mergedAfter ? `, mergedAfter=${config.mergedAfter}` : "")}${config.dryRun ? ", dryRun=true" : ""}`,
   );
 
   const processRepo = async (
@@ -401,6 +422,7 @@ export async function runScan(
 
     let prs: Awaited<ReturnType<typeof github.searchMergedPullRequests>>;
     const exhaustiveIssueScan = Boolean(normalizedTargetRepo && repo.fullName.toLowerCase() === normalizedTargetRepo);
+    const rawSearchLimit = exhaustiveIssueScan ? undefined : Math.min(Math.max(config.prLimit * 10, config.prLimit), 1000);
     const searchStep = exhaustiveIssueScan
       ? "issue_search_full"
       : (config.scanMode === "issue-first" ? "issue_search" : "pr_search");
@@ -409,10 +431,10 @@ export async function runScan(
         searchStep,
         timingsForRepo,
         () => exhaustiveIssueScan
-          ? github.searchAllClosedIssuesWithMergedPullRequests(repo, config.mergedAfter)
+          ? github.searchAllClosedIssuesWithMergedPullRequests(repo)
           : (config.scanMode === "issue-first"
-            ? github.searchClosedIssuesWithMergedPullRequests(repo, config.prLimit, config.mergedAfter)
-            : github.searchMergedPullRequests(repo, config.prLimit, config.mergedAfter)),
+            ? github.searchClosedIssuesWithMergedPullRequests(repo, rawSearchLimit as number, config.mergedAfter)
+            : github.searchMergedPullRequests(repo, rawSearchLimit as number, config.mergedAfter)),
         scanTimings,
       );
       prs = r.result;
@@ -437,8 +459,9 @@ export async function runScan(
       return;
     }
 
+    const issueToPrNumbers = buildIssueToPullRequestMap(prs);
     let foundAcceptedForRepo = false;
-    let dockerBuildFailuresForRepo = 0;
+    let basicFilterPassesForRepo = 0;
     let stoppedAfterRepeatedDockerFailures = false;
     let repeatedDockerFailureSummary: string | undefined;
     const dockerFailureFingerprintsForRepo = new Map<string, { count: number; summary: string }>();
@@ -484,8 +507,17 @@ export async function runScan(
         testsUnableToRun: false,
       };
 
-      if (issueRefs.length === 0) {
-        candidate.rejectionReasons.push("PR has no verified closed GitHub issue link");
+      if (issueRefs.length !== 1) {
+        candidate.rejectionReasons.push(
+          issueRefs.length === 0
+            ? "PR must be linked to exactly one verified closed GitHub issue"
+            : "PR is linked to more than one verified closed GitHub issue",
+        );
+      } else {
+        const linkedPrCount = issueToPrNumbers.get(issueKey(issueRefs[0]))?.size ?? 1;
+        if (linkedPrCount !== 1) {
+          candidate.rejectionReasons.push("linked issue is associated with another pull request");
+        }
       }
       if (!analysis.accepted) {
         candidate.rejectionReasons.push(
@@ -498,6 +530,7 @@ export async function runScan(
         insertScanCandidate(db, scanId, repoId, prId, candidate);
         continue;
       }
+      basicFilterPassesForRepo += 1;
 
       let snapshot: Awaited<ReturnType<typeof prepareSnapshot>>;
       try {
@@ -570,7 +603,6 @@ export async function runScan(
             candidate.rejectionReasons.push("Docker build failed at pre-fix snapshot");
             candidate.testsUnableToRun = true;
             candidate.testsUnableToRunReason = "Docker build failed";
-            dockerBuildFailuresForRepo += 1;
 
             const failure = summarizeDockerFailure(candidate);
             if (failure) {
@@ -608,6 +640,10 @@ export async function runScan(
           foundAcceptedForRepo = true;
           insertScanCandidate(db, scanId, repoId, prId, candidate);
           progress(`Accepted ${repo.fullName}#${pr.number}`);
+          if (!exhaustiveIssueScan && basicFilterPassesForRepo >= config.prLimit) {
+            progress(`Stopping ${repo.fullName}: reached basic-filter PR limit of ${config.prLimit}`);
+            break;
+          }
           continue;
         }
 
@@ -625,6 +661,10 @@ export async function runScan(
               ? `Stopping ${repo.fullName}: repeated Docker failure fingerprint '${repeatedDockerFailureSummary}' detected, keeping already accepted PRs and skipping the rest`
               : `Stopping ${repo.fullName}: repeated Docker failure fingerprint '${repeatedDockerFailureSummary}' detected, treating the repo as rejected`,
           );
+          break;
+        }
+        if (!exhaustiveIssueScan && basicFilterPassesForRepo >= config.prLimit) {
+          progress(`Stopping ${repo.fullName}: reached basic-filter PR limit of ${config.prLimit}`);
           break;
         }
       } finally {

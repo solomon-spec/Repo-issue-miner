@@ -113,6 +113,7 @@ export interface PrAnalysis {
   relevantTestFiles: PullRequestFile[];
   touchedDirectories: string[];
   ignoredFiles: string[];
+  codeLinesChanged: number;
   nonTrivialScore: number;
   nonTrivialReasons: string[];
   accepted: boolean;
