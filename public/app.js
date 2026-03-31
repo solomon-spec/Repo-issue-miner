@@ -256,6 +256,7 @@
     $("#f-repo-concurrency").value = "1";
     $("#f-min-stars").value = "0";
     $("#f-pr-limit").value = "100";
+    $("#f-merged-after").value = "";
   }
 
   /* ---- Dashboard ---- */

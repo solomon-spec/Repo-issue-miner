@@ -67,6 +67,7 @@ export function analyzePullRequestFiles(files: PullRequestFile[], language: Lang
   const touchedDirectories: string[] = [];
   const scoreReasons: string[] = [];
   let score = 0;
+  let codeLinesChanged = 0;
 
   for (const file of files) {
     if (isIgnored(file.filename)) {
@@ -80,6 +81,7 @@ export function analyzePullRequestFiles(files: PullRequestFile[], language: Lang
       relevantTestFiles.push(file);
     } else {
       relevantSourceFiles.push(file);
+      codeLinesChanged += Math.max(0, file.additions) + Math.max(0, file.deletions);
     }
     touchedDirectories.push(touchedDirectory(file.filename));
   }
@@ -88,6 +90,12 @@ export function analyzePullRequestFiles(files: PullRequestFile[], language: Lang
   if (relevantSourceFiles.length >= 5) {
     score += 3;
     scoreReasons.push(`touches ${relevantSourceFiles.length} relevant source files`);
+  }
+  if (codeLinesChanged > 300) {
+    score += 3;
+    scoreReasons.push(`changes ${codeLinesChanged} relevant code lines`);
+  } else {
+    scoreReasons.push(`changes only ${codeLinesChanged} relevant code lines`);
   }
   if (uniqueDirs.length >= 2) {
     score += 2;
@@ -110,12 +118,13 @@ export function analyzePullRequestFiles(files: PullRequestFile[], language: Lang
     scoreReasons.push("looks mechanically scoped");
   }
 
-  const accepted = relevantSourceFiles.length >= 5 && score >= 5;
+  const accepted = relevantSourceFiles.length >= 5 && codeLinesChanged > 300 && score >= 5;
   return {
     relevantSourceFiles,
     relevantTestFiles,
     touchedDirectories: uniqueDirs,
     ignoredFiles,
+    codeLinesChanged,
     nonTrivialScore: score,
     nonTrivialReasons: scoreReasons,
     accepted,
