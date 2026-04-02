@@ -10,6 +10,7 @@ import { executeTestPlan, executeTestPlanWithTests } from "./docker.js";
 import { fixDockerfileForTestFailure, generateDockerfileForTests, resolveTestPlan } from "./gemini.js";
 import { GitHubClient } from "./github.js";
 import { getDb, getStats, getRepos, getRepoById, deleteRepo, getScans, getScanById, getIssues, getTestsUnableCandidates, getAcceptedCandidates, getIssuesForCandidate, getIssuesForCandidateIds, getScanCandidateById, refreshScanCounts, updateScanCandidateState } from "./db.js";
+import { cleanupProjectStorage } from "./storage.js";
 import { CommandAbortedError, ensureDir, readUtf8Safe, unique } from "./util.js";
 
 const __dirname = fileURLToPath(new URL(".", import.meta.url));
@@ -421,6 +422,8 @@ async function measureAsyncStep<T>(step: string, fn: () => Promise<T>): Promise<
 export function createApp(config: Config): express.Express {
   const app = express();
   app.use(express.json());
+
+  cleanupProjectStorage(config);
 
   // Serve static frontend
   const publicDir = resolve(join(__dirname, "..", "public"));

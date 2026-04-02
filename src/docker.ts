@@ -11,6 +11,8 @@ export type ExecutionMonitor = {
   testTimeoutMs?: number;
 };
 
+let dockerBuilderSequence = 0;
+
 function formatTimeoutMs(timeoutMs: number): string {
   if (timeoutMs < 60_000) return `${Math.round(timeoutMs / 1000)}s`;
   const minutes = timeoutMs / 60_000;
@@ -26,6 +28,32 @@ async function cleanupTemporaryDockerImage(imageTag: string | undefined): Promis
   const combinedOutput = `${result.stdout}\n${result.stderr}`;
   if (result.code !== 0 && !/no such image/i.test(combinedOutput)) {
     throw new Error(combinedOutput.trim() || `failed to remove temporary image ${imageTag}`);
+  }
+}
+
+async function createEphemeralDockerBuilder(): Promise<string> {
+  dockerBuilderSequence += 1;
+  const builderName = sanitizeTag(`repo-issue-miner-${process.pid}-${Date.now().toString(36)}-${dockerBuilderSequence}`);
+  const result = await runCommand({
+    cmd: "docker",
+    args: ["buildx", "create", "--name", builderName, "--driver", "docker-container", "--bootstrap"],
+  });
+  const combinedOutput = `${result.stdout}\n${result.stderr}`;
+  if (result.code !== 0) {
+    throw new Error(combinedOutput.trim() || "failed to create temporary Docker builder");
+  }
+  return builderName;
+}
+
+async function cleanupEphemeralDockerBuilder(builderName: string | undefined): Promise<void> {
+  if (!builderName) return;
+  const result = await runCommand({
+    cmd: "docker",
+    args: ["buildx", "rm", "-f", builderName],
+  });
+  const combinedOutput = `${result.stdout}\n${result.stderr}`;
+  if (result.code !== 0 && !/no builder|not found/i.test(combinedOutput)) {
+    throw new Error(combinedOutput.trim() || `failed to remove temporary builder ${builderName}`);
   }
 }
 
@@ -50,6 +78,7 @@ async function buildDirectDockerImage(
   snapshot: RepoSnapshot,
   dockerfilePath: string,
   imageTag: string,
+  builderName: string,
   monitor: ExecutionMonitor,
   buildStdoutPath: string,
   buildStderrPath: string,
@@ -57,7 +86,7 @@ async function buildDirectDockerImage(
   const notes: string[] = [];
   const build = await runCommand({
     cmd: "docker",
-    args: ["buildx", "build", "--progress=plain", "--load", "-t", imageTag, "-f", dockerfilePath, snapshot.rootDir],
+    args: ["buildx", "build", "--builder", builderName, "--progress=plain", "--load", "-t", imageTag, "-f", dockerfilePath, snapshot.rootDir],
     timeoutMs: monitor.buildTimeoutMs,
     signal: monitor.signal,
     stdoutPath: buildStdoutPath,
@@ -147,6 +176,7 @@ export async function executeTestPlan(
   const buildStderrPath = join(logDir, "build.stderr.log");
   const testStdoutPath = join(logDir, "test.stdout.log");
   const testStderrPath = join(logDir, "test.stderr.log");
+  let builderName: string | undefined;
 
   let buildPassed = false;
   let testsPassed = false;
@@ -176,8 +206,9 @@ export async function executeTestPlan(
           notes: [...notes, "missing dockerfile path"],
         };
       }
+      builderName = await createEphemeralDockerBuilder();
       monitor.onStage?.("Building Docker image");
-      const build = await buildDirectDockerImage(snapshot, dockerfilePath, imageTag, monitor, buildStdoutPath, buildStderrPath);
+      const build = await buildDirectDockerImage(snapshot, dockerfilePath, imageTag, builderName, monitor, buildStdoutPath, buildStderrPath);
       buildExitCode = build.buildExitCode;
       buildPassed = build.buildPassed;
       builtImageId = build.builtImageId;
@@ -200,8 +231,9 @@ export async function executeTestPlan(
         };
       }
 
+      builderName = await createEphemeralDockerBuilder();
       monitor.onStage?.("Building Docker image");
-      const build = await buildDirectDockerImage(snapshot, dockerfilePath, imageTag, monitor, buildStdoutPath, buildStderrPath);
+      const build = await buildDirectDockerImage(snapshot, dockerfilePath, imageTag, builderName, monitor, buildStdoutPath, buildStderrPath);
       buildExitCode = build.buildExitCode;
       buildPassed = build.buildPassed;
       builtImageId = build.builtImageId;
@@ -237,10 +269,11 @@ export async function executeTestPlan(
         };
       }
       const cwd = snapshot.rootDir;
+      builderName = await createEphemeralDockerBuilder();
       monitor.onStage?.("Building Docker Compose services");
       const build = await runCommand({
         cmd: "docker",
-        args: ["compose", "-f", plan.composeFilePath ?? "docker-compose.yml", "build", ...composeBuildServices],
+        args: ["compose", "-f", plan.composeFilePath ?? "docker-compose.yml", "build", "--builder", builderName, ...composeBuildServices],
         cwd,
         timeoutMs: monitor.buildTimeoutMs,
         signal: monitor.signal,
@@ -277,9 +310,17 @@ export async function executeTestPlan(
       notes,
     };
   } finally {
-    if (plan.runner !== "compose-run") {
+    if (plan.runner === "compose-run") {
+      const composeFile = plan.composeFilePath ?? "docker-compose.yml";
+      await runCommand({
+        cmd: "docker",
+        args: ["compose", "-f", composeFile, "down", "--rmi", "local", "--remove-orphans"],
+        cwd: snapshot.rootDir,
+      }).catch(() => {});
+    } else {
       await cleanupTemporaryDockerImage(imageTag).catch(() => {});
     }
+    await cleanupEphemeralDockerBuilder(builderName).catch(() => {});
   }
 }
 
@@ -299,6 +340,7 @@ export async function executeTestPlanWithTests(
   const buildStderrPath = join(logDir, "build.stderr.log");
   const testStdoutPath = join(logDir, "test.stdout.log");
   const testStderrPath = join(logDir, "test.stderr.log");
+  let builderName: string | undefined;
 
   let buildPassed = false;
   let testsPassed = false;
@@ -340,8 +382,9 @@ export async function executeTestPlanWithTests(
       };
     }
 
+    builderName = await createEphemeralDockerBuilder();
     monitor.onStage?.("Building Docker image");
-    const build = await buildDirectDockerImage(snapshot, dockerfilePath, imageTag, monitor, buildStdoutPath, buildStderrPath);
+    const build = await buildDirectDockerImage(snapshot, dockerfilePath, imageTag, builderName, monitor, buildStdoutPath, buildStderrPath);
     buildPassed = build.buildPassed;
     buildExitCode = build.buildExitCode;
     builtImageId = build.builtImageId;
@@ -377,5 +420,6 @@ export async function executeTestPlanWithTests(
     };
   } finally {
     await cleanupTemporaryDockerImage(imageTag).catch(() => {});
+    await cleanupEphemeralDockerBuilder(builderName).catch(() => {});
   }
 }

@@ -5,6 +5,7 @@ import { resolveTestPlan } from "./gemini.js";
 import { executeTestPlan } from "./docker.js";
 import { analyzePullRequestFiles, chooseLanguageBucket } from "./parsing.js";
 import { screenRepository } from "./repo-screen.js";
+import { cleanupProjectStorage } from "./storage.js";
 import {
   CandidateReport,
   Config,
@@ -305,6 +306,11 @@ export async function runScan(
 ): Promise<ScanReport> {
   ensureDir(config.outputRoot);
   ensureDir(config.workRoot);
+  const cleanupSummary = cleanupProjectStorage(config);
+  if (!cleanupSummary.skipped && cleanupSummary.removedItems.length > 0) {
+    const freedMb = (cleanupSummary.removedBytes / (1024 * 1024)).toFixed(1);
+    onProgress?.(`Storage cleanup removed ${cleanupSummary.removedItems.length} stale item(s), freeing about ${freedMb} MiB`);
+  }
   const db = getDb(config.dbPath);
   const github = new GitHubClient(config);
   const accepted: CandidateReport[] = [];
