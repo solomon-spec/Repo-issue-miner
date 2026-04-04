@@ -155,7 +155,7 @@ export function buildSetupPrompt(
 export async function collectChangedFiles(worktreePath: string): Promise<string[]> {
   const result = await runCommand({
     cmd: "git",
-    args: ["status", "--short"],
+    args: ["status", "--porcelain=v1"],
     cwd: worktreePath,
   });
   if (result.code !== 0) {
@@ -163,9 +163,8 @@ export async function collectChangedFiles(worktreePath: string): Promise<string[
   }
   return result.stdout
     .split(/\r?\n/g)
-    .map((line) => line.trim())
-    .filter(Boolean)
-    .map((line) => line.slice(3).trim())
+    .filter((line) => line.trim().length > 0)
+    .map((line) => line.length > 3 ? line.slice(3).trim() : "")
     .filter(Boolean);
 }
 

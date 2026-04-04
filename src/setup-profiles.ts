@@ -14,6 +14,7 @@ const COMMON_SETUP_RULES = [
   "Pin dependency versions using the repository's existing dependency artifacts and remove lock files instead of introducing a new file structure.",
   "Keep the project structure intact and make the smallest setup-focused changes that work.",
   "Build the project and run tests successfully before finishing when the repository allows it.",
+  "If Docker access is available, actually run the Docker build and test commands during setup instead of only suggesting them.",
   "Do not create commits yourself. The platform will configure git author details and create the setup commit after validation.",
 ].join("\n");
 
@@ -35,6 +36,7 @@ Prepare this Python repository for later issue work:
 const PYTHON_VALIDATION_PROMPT = [
   "Validate the setup by building the root Dockerfile, running the inferred Python test command inside the container, confirming the README's native install/test instructions match the repository, and confirming dependency versions are pinned consistently across the existing Python dependency files.",
   "Do not use Docker Compose.",
+  "Actually execute the Docker build and test commands when Docker access is available.",
   "Report the exact docker build/run commands used, the equivalent pip-freeze command, whether tests passed, and any remaining setup blockers.",
 ].join("\n");
 
@@ -56,6 +58,7 @@ Prepare this JavaScript repository for later issue work:
 const JAVASCRIPT_VALIDATION_PROMPT = [
   "Validate the setup by building the root Dockerfile, running the repository's inferred JavaScript test command inside the container, confirming the README's native install/test instructions match the repository, and confirming dependency versions are pinned in the existing project artifacts after lock-file removal.",
   "Do not use Docker Compose.",
+  "Actually execute the Docker build and test commands when Docker access is available.",
   "Report the exact docker build/run commands used, the dependency-inspection command you chose, whether tests passed, and any remaining setup blockers.",
 ].join("\n");
 
@@ -77,6 +80,7 @@ Prepare this TypeScript repository for later issue work:
 const TYPESCRIPT_VALIDATION_PROMPT = [
   "Validate the setup by building the root Dockerfile, running the repository's inferred TypeScript test command and typecheck command inside the container when available, confirming the README's native install/typecheck/test instructions match the repository, and confirming dependency versions are pinned in the existing project artifacts after lock-file removal.",
   "Do not use Docker Compose.",
+  "Actually execute the Docker build and test commands when Docker access is available.",
   "Report the exact docker build/run commands used, the dependency-inspection command you chose, whether checks passed, and any remaining setup blockers.",
 ].join("\n");
 
@@ -186,7 +190,7 @@ export function buildDefaultSetupProfiles(cloneRootPath: string): SetupProfileSe
       validationPrompt: PYTHON_VALIDATION_PROMPT,
       cloneRootPath,
       model: undefined,
-      sandboxMode: "workspace-write",
+      sandboxMode: "danger-full-access",
     },
     {
       name: DEFAULT_SETUP_PROFILE_NAMES.javascript,
@@ -196,7 +200,7 @@ export function buildDefaultSetupProfiles(cloneRootPath: string): SetupProfileSe
       validationPrompt: JAVASCRIPT_VALIDATION_PROMPT,
       cloneRootPath,
       model: undefined,
-      sandboxMode: "workspace-write",
+      sandboxMode: "danger-full-access",
     },
     {
       name: DEFAULT_SETUP_PROFILE_NAMES.typescript,
@@ -206,7 +210,7 @@ export function buildDefaultSetupProfiles(cloneRootPath: string): SetupProfileSe
       validationPrompt: TYPESCRIPT_VALIDATION_PROMPT,
       cloneRootPath,
       model: undefined,
-      sandboxMode: "workspace-write",
+      sandboxMode: "danger-full-access",
     },
   ];
 }

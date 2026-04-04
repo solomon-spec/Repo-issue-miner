@@ -111,23 +111,35 @@ export async function prepareSnapshot(
       throw new Error(`git remote set-url failed for ${repo.fullName}: ${setRemote.stderr || setRemote.stdout}`);
     }
 
-    await runCommand({
+    const hasCommit = await runCommand({
       cmd: "git",
-      args: ["fetch", "--depth", "1", "origin", sha],
+      args: ["cat-file", "-e", `${sha}^{commit}`],
       cwd: targetDir,
       timeoutMs: config.buildTimeoutMs,
       signal: options.signal,
     });
+    if (hasCommit.code !== 0) {
+      const fetch = await runCommand({
+        cmd: "git",
+        args: ["fetch", "origin", sha],
+        cwd: targetDir,
+        timeoutMs: config.buildTimeoutMs,
+        signal: options.signal,
+      });
+      if (fetch.code !== 0) {
+        throw new Error(`git fetch failed for ${repo.fullName}@${sha}: ${fetch.stderr || fetch.stdout}`);
+      }
+    }
 
     const checkout = await runCommand({
       cmd: "git",
-      args: ["checkout", "--force", sha],
+      args: ["checkout", "-B", repo.defaultBranch, sha],
       cwd: targetDir,
       timeoutMs: config.buildTimeoutMs,
       signal: options.signal,
     });
     if (checkout.code !== 0) {
-      throw new Error(`git checkout failed for ${repo.fullName}@${sha}: ${checkout.stderr || checkout.stdout}`);
+      throw new Error(`git checkout failed for ${repo.fullName}@${sha} on ${repo.defaultBranch}: ${checkout.stderr || checkout.stdout}`);
     }
 
     const sizeBytes = directorySize(targetDir);

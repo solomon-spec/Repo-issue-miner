@@ -196,6 +196,11 @@
   let setupProfileAutoSelectPending = true;
   let setupRunPoller = null;
   let setupRunPollInFlight = false;
+  let setupRunTerminalState = {
+    runId: null,
+    scrollTop: 0,
+    autoFollow: true,
+  };
 
   function switchPage(page) {
     if (page !== "setup") {
@@ -706,7 +711,7 @@
     $("#setup-profile-name").value = profile?.name || "";
     $("#setup-profile-model").value = profile?.model || "";
     $("#setup-profile-clone-root").value = profile?.cloneRootPath || "";
-    $("#setup-profile-sandbox").value = profile?.sandboxMode || "workspace-write";
+    $("#setup-profile-sandbox").value = profile?.sandboxMode || "danger-full-access";
     $("#setup-profile-prompt").value = profile?.prompt || "";
     $("#setup-profile-context-paths").value = Array.isArray(profile?.contextPaths) ? profile.contextPaths.join("\n") : "";
     $("#setup-profile-writable-paths").value = Array.isArray(profile?.writablePaths) ? profile.writablePaths.join("\n") : "";
@@ -842,8 +847,23 @@
     const stopButton = $("#setup-stop-run");
     if (!container || !stopButton) return;
 
+    const existingTerminalOutput = $("[data-setup-terminal-output]", container);
+    if (existingTerminalOutput && setupRunTerminalState.runId === selectedSetupRunId) {
+      const distanceFromBottom = existingTerminalOutput.scrollHeight - (existingTerminalOutput.scrollTop + existingTerminalOutput.clientHeight);
+      setupRunTerminalState = {
+        runId: selectedSetupRunId,
+        scrollTop: existingTerminalOutput.scrollTop,
+        autoFollow: distanceFromBottom <= 24,
+      };
+    }
+
     if (!run) {
       stopButton.disabled = true;
+      setupRunTerminalState = {
+        runId: null,
+        scrollTop: 0,
+        autoFollow: true,
+      };
       container.innerHTML = `<div class="empty-state"><div class="empty-icon">🧪</div><p>Select a setup run to inspect its prompt, output, changed files, and diff.</p></div>`;
       return;
     }
@@ -899,7 +919,7 @@
       <div class="setup-output-stack">
         <div class="setup-detail-section">
           <span class="setup-detail-label">Terminal Output</span>
-          <pre class="log-output">${esc(consoleOutput)}</pre>
+          <pre class="log-output" data-setup-terminal-output="1">${esc(consoleOutput)}</pre>
         </div>
         <div class="setup-detail-section">
           <span class="setup-detail-label">Final Message</span>
@@ -911,6 +931,21 @@
         </div>
       </div>
     `;
+
+    const terminalOutput = $("[data-setup-terminal-output]", container);
+    if (terminalOutput) {
+      const shouldAutoFollow = setupRunTerminalState.runId !== run.id
+        ? run.status === "running"
+        : setupRunTerminalState.autoFollow;
+      terminalOutput.scrollTop = shouldAutoFollow
+        ? terminalOutput.scrollHeight
+        : Math.min(setupRunTerminalState.scrollTop, terminalOutput.scrollHeight);
+      setupRunTerminalState = {
+        runId: run.id,
+        scrollTop: terminalOutput.scrollTop,
+        autoFollow: shouldAutoFollow,
+      };
+    }
   }
 
   async function loadSetupRunDetail(runId) {

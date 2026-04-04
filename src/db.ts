@@ -372,6 +372,7 @@ function defaultSetupCloneRoot(): string {
 function seedDefaultSetupProfiles(db: Database.Database): void {
   const cloneRootPath = defaultSetupCloneRoot();
   const profiles = buildDefaultSetupProfiles(cloneRootPath);
+  const defaultProfileNames = Object.values(DEFAULT_SETUP_PROFILE_NAMES);
   const pythonProfile = profiles.find((profile) => profile.name === DEFAULT_SETUP_PROFILE_NAMES.python);
 
   if (pythonProfile) {
@@ -422,6 +423,16 @@ function seedDefaultSetupProfiles(db: Database.Database): void {
       profile.name,
     );
   }
+
+  db.prepare(`
+    UPDATE setup_profiles
+    SET sandbox_mode = 'danger-full-access',
+        updated_at = CASE
+          WHEN sandbox_mode <> 'danger-full-access' THEN datetime('now')
+          ELSE updated_at
+        END
+    WHERE name IN (${defaultProfileNames.map(() => "?").join(", ")})
+  `).run(...defaultProfileNames);
 }
 
 function parseValidationPrompt(rawPrompt: unknown, legacyCommands: string | null | undefined): string {
