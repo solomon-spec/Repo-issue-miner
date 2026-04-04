@@ -639,6 +639,137 @@ tbody tr:hover { background: var(--bg-hover); }
   resize: vertical;
 }
 
+.codex-task-panel {
+  border-color: rgba(255, 184, 108, 0.2);
+  background: rgba(255, 184, 108, 0.04);
+}
+
+.codex-task-grid,
+.codex-draft-grid,
+.codex-review-controls {
+  display: grid;
+  gap: 0.8rem;
+}
+
+.codex-task-grid,
+.codex-draft-grid {
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+}
+
+.codex-task-wide {
+  grid-column: 1 / -1;
+}
+
+.codex-two-column {
+  display: grid;
+  gap: 0.8rem;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  margin-top: 0.85rem;
+}
+
+.codex-info-card,
+.codex-draft-editor {
+  margin-top: 0.85rem;
+  padding: 0.85rem;
+  border-radius: var(--radius-sm);
+  border: 1px solid rgba(255, 184, 108, 0.18);
+  background: rgba(13, 17, 23, 0.38);
+}
+
+.codex-task-panel input,
+.codex-task-panel select {
+  width: 100%;
+  padding: 0.55rem 0.75rem;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border);
+  background: var(--bg-input);
+  color: var(--text-primary);
+  font-size: 0.88rem;
+  font-family: inherit;
+}
+
+.codex-prompt-output {
+  max-height: 260px;
+  margin-top: 0;
+}
+
+.codex-review-run-panel {
+  margin-top: 0.85rem;
+}
+
+.codex-draft-header {
+  display: flex;
+  gap: 0.6rem;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  margin-bottom: 0.75rem;
+}
+
+.codex-axis-grid {
+  display: grid;
+  gap: 0.7rem;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  margin: 0.8rem 0;
+}
+
+.codex-axis-row {
+  display: grid;
+  gap: 0.35rem;
+  font-size: 0.82rem;
+  color: var(--text-secondary);
+}
+
+.task-workspace-shell {
+  display: grid;
+  gap: 1rem;
+  grid-template-columns: minmax(220px, 300px) minmax(0, 1fr);
+}
+
+.task-selector-list {
+  display: grid;
+  gap: 0.7rem;
+  align-content: start;
+}
+
+.task-selector-item {
+  display: grid;
+  gap: 0.2rem;
+  text-align: left;
+  padding: 0.85rem;
+  border-radius: var(--radius-sm);
+  border: 1px solid rgba(88, 166, 255, 0.16);
+  background: rgba(13, 17, 23, 0.5);
+  color: var(--text-primary);
+  cursor: pointer;
+  transition: border-color var(--transition), transform var(--transition);
+}
+
+.task-selector-item:hover,
+.task-selector-item.active {
+  border-color: rgba(255, 184, 108, 0.45);
+  transform: translateY(-1px);
+}
+
+.task-selector-item span {
+  font-size: 0.8rem;
+  color: var(--text-secondary);
+}
+
+.task-workspace-main {
+  min-width: 0;
+}
+
+.accepted-card-task {
+  margin: 0;
+}
+
+@media (max-width: 980px) {
+  .task-workspace-shell {
+    grid-template-columns: 1fr;
+  }
+}
+
 .accepted-review-meta {
   font-size: 0.78rem;
   color: var(--text-secondary);

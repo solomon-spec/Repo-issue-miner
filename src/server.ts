@@ -1,16 +1,46 @@
 import express from "express";
 import { createHash } from "node:crypto";
-import { writeFileSync } from "node:fs";
-import { dirname, join, relative, resolve, sep } from "node:path";
+import { existsSync, writeFileSync } from "node:fs";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
-import { Config, ExecutionResult, ScanConfigOverrides, ScanPerformanceMetrics, ScanStatus, SearchRepo, TestPlan, Language } from "./types.js";
+import {
+  CodexAxisName,
+  CodexAxisPreference,
+  CodexIssueSource,
+  CodexPrContext,
+  CodexReviewDraft,
+  CodexTaskRound,
+  CodexTaskState,
+  Config,
+  ExecutionResult,
+  PromptDraft,
+  ScanConfigOverrides,
+  ScanPerformanceMetrics,
+  ScanStatus,
+  SearchRepo,
+  TestPlan,
+  Language,
+} from "./types.js";
 import { runScan } from "./pipeline.js";
 import { cleanupSnapshot, prepareSnapshot } from "./git.js";
 import { executeTestPlan, executeTestPlanWithTests } from "./docker.js";
 import { fixDockerfileForTestFailure, generateDockerfileForTests, resolveTestPlan } from "./gemini.js";
 import { GitHubClient } from "./github.js";
 import { getDb, getStats, getRepos, getRepoById, deleteRepo, getScans, getScanById, getIssues, getTestsUnableCandidates, getAcceptedCandidates, getIssuesForCandidate, getIssuesForCandidateIds, getScanCandidateById, refreshScanCounts, updateScanCandidateState } from "./db.js";
-import { CommandAbortedError, ensureDir, readUtf8Safe, unique } from "./util.js";
+import {
+  buildCodexReviewPrompt,
+  buildFollowUpPrompt,
+  buildPromptOne,
+  buildTmuxSessionInfo,
+  CODEX_AXIS_NAMES,
+  CODEX_TASK_MAX_PROMPTS,
+  createFallbackReviewDraft,
+  makePromptDraft,
+  parseCodexReviewOutput,
+  summarizePullRequestFiles,
+  writeReviewBundle,
+} from "./codex-task.js";
+import { CommandAbortedError, ensureDir, readUtf8Safe, runCommand, unique, writeJson } from "./util.js";
 
 const __dirname = fileURLToPath(new URL(".", import.meta.url));
 
@@ -41,9 +71,23 @@ type ActiveTestRerunState = {
 
 type ActiveAcceptedTestRunState = ActiveTestRerunState;
 
+type ActiveCodexReviewRunState = {
+  candidateId: number;
+  round: number;
+  status: "running" | "completed" | "failed";
+  stage: string;
+  startedAt: string;
+  finishedAt?: string;
+  logs: string[];
+  liveOutput: string;
+  artifactDir?: string;
+  error?: string;
+};
+
 let activeScan: ActiveScanState | undefined;
 const activeTestRerunStates = new Map<number, ActiveTestRerunState>();
 const activeAcceptedTestRunStates = new Map<number, ActiveAcceptedTestRunState>();
+const activeCodexReviewRunStates = new Map<string, ActiveCodexReviewRunState>();
 const EXECUTION_REASON_PREFIXES = [
   "failed to prepare snapshot",
   "snapshot exceeds max size:",
@@ -92,6 +136,47 @@ function appendTestRerunOutput(
     })
     .join("\n");
   rerun.liveOutput = `${rerun.liveOutput}${prefixed}${prefixed.endsWith("\n") ? "" : "\n"}`.slice(-120_000);
+}
+
+function codexReviewRunKey(candidateId: number, round: number): string {
+  return `${candidateId}:${round}`;
+}
+
+function appendCodexReviewLog(run: ActiveCodexReviewRunState, msg: string): void {
+  const timestamp = new Date().toISOString();
+  run.logs.push(`[${timestamp}] ${msg}`);
+  run.stage = msg;
+  if (run.logs.length > 300) {
+    run.logs.splice(0, run.logs.length - 300);
+  }
+}
+
+function appendCodexReviewOutput(run: ActiveCodexReviewRunState, stream: "stdout" | "stderr", chunk: string): void {
+  const text = chunk.replace(/\r\n/g, "\n");
+  const prefixed = text
+    .split("\n")
+    .map((line, index, items) => {
+      if (!line && index === items.length - 1) return "";
+      return `[codex:${stream}] ${line}`;
+    })
+    .join("\n");
+  run.liveOutput = `${run.liveOutput}${prefixed}${prefixed.endsWith("\n") ? "" : "\n"}`.slice(-120_000);
+}
+
+function codexReviewStateToApi(run: ActiveCodexReviewRunState): Record<string, unknown> {
+  return {
+    candidateId: run.candidateId,
+    round: run.round,
+    running: run.status === "running",
+    status: run.status,
+    stage: run.stage,
+    startedAt: run.startedAt,
+    finishedAt: run.finishedAt ?? null,
+    logs: run.logs,
+    liveOutput: run.liveOutput,
+    artifactDir: run.artifactDir ?? null,
+    error: run.error ?? null,
+  };
 }
 
 function rerunStateToApi(rerun: ActiveTestRerunState): Record<string, unknown> {
@@ -163,6 +248,270 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
 
 function asNonEmptyString(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function asStringArray(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((item) => typeof item === "string" ? item.trim() : "")
+    .filter(Boolean);
+}
+
+function normalizeCodexAxisPreference(
+  value: unknown,
+  fallbackWinner: "A" | "B",
+): CodexAxisPreference {
+  if (
+    value === "slight_a"
+    || value === "a"
+    || value === "strong_a"
+    || value === "slight_b"
+    || value === "b"
+    || value === "strong_b"
+  ) {
+    return value;
+  }
+  return fallbackWinner === "A" ? "slight_a" : "slight_b";
+}
+
+function normalizeCodexReviewDraft(value: unknown): CodexReviewDraft | undefined {
+  const draft = asRecord(value);
+  if (!draft) return undefined;
+  const winner = draft.winner === "B" ? "B" : "A";
+  const modelA = asRecord(draft.modelA);
+  const modelB = asRecord(draft.modelB);
+  const axesRaw = asRecord(draft.axes) ?? {};
+  const axes = Object.fromEntries(
+    CODEX_AXIS_NAMES.map((axis) => [axis, normalizeCodexAxisPreference(axesRaw[axis], winner)]),
+  ) as Record<CodexAxisName, CodexAxisPreference>;
+  return {
+    winner,
+    modelA: {
+      pros: asNonEmptyString(modelA?.pros) ?? "",
+      cons: asNonEmptyString(modelA?.cons) ?? "",
+    },
+    modelB: {
+      pros: asNonEmptyString(modelB?.pros) ?? "",
+      cons: asNonEmptyString(modelB?.cons) ?? "",
+    },
+    axes,
+    overallJustification: asNonEmptyString(draft.overallJustification) ?? "",
+    winnerUnresolvedCons: asStringArray(draft.winnerUnresolvedCons),
+    nextPrompt: asNonEmptyString(draft.nextPrompt) ?? "",
+    confidenceNotes: asNonEmptyString(draft.confidenceNotes) ?? "",
+    generatedAt: asNonEmptyString(draft.generatedAt) ?? new Date().toISOString(),
+    artifactDir: asNonEmptyString(draft.artifactDir),
+  };
+}
+
+function normalizeCodexTaskState(details: Record<string, unknown>): CodexTaskState | undefined {
+  const raw = asRecord(details.codexTask);
+  const issue = asRecord(raw?.issue);
+  if (!raw || !issue || !asNonEmptyString(raw.hfiUuid) || !asNonEmptyString(issue.title)) {
+    return undefined;
+  }
+  const promptsRaw = Array.isArray(raw.prompts) ? raw.prompts : [];
+  const prompts = promptsRaw
+    .map((item) => asRecord(item))
+    .filter((item): item is Record<string, unknown> => Boolean(item))
+    .map((item): PromptDraft => ({
+      round: Math.max(1, Math.min(CODEX_TASK_MAX_PROMPTS, Number(item.round) || 1)),
+      prompt: asNonEmptyString(item.prompt) ?? "",
+      source: item.source === "review_follow_up" ? "review_follow_up" : "issue_rewrite",
+      generatedAt: asNonEmptyString(item.generatedAt) ?? new Date().toISOString(),
+    }))
+    .filter((item) => item.prompt);
+  const roundsRaw = Array.isArray(raw.rounds) ? raw.rounds : [];
+  const rounds = roundsRaw
+    .map((item) => asRecord(item))
+    .filter((item): item is Record<string, unknown> => Boolean(item))
+    .map((item) => ({
+      round: Math.max(1, Math.min(CODEX_TASK_MAX_PROMPTS, Number(item.round) || 1)),
+      notesA: asNonEmptyString(item.notesA),
+      notesB: asNonEmptyString(item.notesB),
+      reviewDraft: normalizeCodexReviewDraft(item.reviewDraft),
+      artifactDir: asNonEmptyString(item.artifactDir),
+      generatedAt: asNonEmptyString(item.generatedAt),
+      promptGeneratedForNextRound: Number.isFinite(Number(item.promptGeneratedForNextRound))
+        ? Number(item.promptGeneratedForNextRound)
+        : undefined,
+    }))
+    .sort((left, right) => left.round - right.round);
+  return {
+    hfiUuid: asNonEmptyString(raw.hfiUuid) ?? "",
+    originalRepoPath: asNonEmptyString(raw.originalRepoPath) ?? "",
+    worktreeAPath: asNonEmptyString(raw.worktreeAPath) ?? "",
+    worktreeBPath: asNonEmptyString(raw.worktreeBPath) ?? "",
+    testCommand: asNonEmptyString(raw.testCommand),
+    currentRound: Math.max(1, Math.min(CODEX_TASK_MAX_PROMPTS, Number(raw.currentRound) || 1)),
+    maxPrompts: CODEX_TASK_MAX_PROMPTS,
+    startedAt: asNonEmptyString(raw.startedAt) ?? new Date().toISOString(),
+    updatedAt: asNonEmptyString(raw.updatedAt) ?? new Date().toISOString(),
+    issue: {
+      owner: asNonEmptyString(issue.owner),
+      repo: asNonEmptyString(issue.repo),
+      number: Number.isFinite(Number(issue.number)) ? Number(issue.number) : undefined,
+      url: asNonEmptyString(issue.url),
+      title: asNonEmptyString(issue.title) ?? "Unknown issue",
+      body: asNonEmptyString(issue.body),
+      selectedFromCount: Math.max(1, Number(issue.selectedFromCount) || 1),
+    },
+    prContext: asRecord(raw.prContext)
+      ? {
+          number: Number.isFinite(Number((raw.prContext as Record<string, unknown>).number))
+            ? Number((raw.prContext as Record<string, unknown>).number)
+            : undefined,
+          url: asNonEmptyString((raw.prContext as Record<string, unknown>).url),
+          title: asNonEmptyString((raw.prContext as Record<string, unknown>).title),
+          body: asNonEmptyString((raw.prContext as Record<string, unknown>).body),
+          mergedAt: asNonEmptyString((raw.prContext as Record<string, unknown>).mergedAt),
+          changedFilesCount: Number.isFinite(Number((raw.prContext as Record<string, unknown>).changedFilesCount))
+            ? Number((raw.prContext as Record<string, unknown>).changedFilesCount)
+            : undefined,
+          changedFiles: Array.isArray((raw.prContext as Record<string, unknown>).changedFiles)
+            ? ((raw.prContext as Record<string, unknown>).changedFiles as Array<Record<string, unknown>>).map((file) => ({
+                filename: asNonEmptyString(file.filename) ?? "unknown",
+                additions: Number(file.additions ?? 0),
+                deletions: Number(file.deletions ?? 0),
+                changes: Number(file.changes ?? 0),
+                status: asNonEmptyString(file.status) ?? "modified",
+              }))
+            : [],
+          fetchedAt: asNonEmptyString((raw.prContext as Record<string, unknown>).fetchedAt) ?? new Date().toISOString(),
+        }
+      : undefined,
+    prompts,
+    rounds,
+  };
+}
+
+function updateCodexTaskState(details: Record<string, unknown>, task: CodexTaskState): Record<string, unknown> {
+  details.codexTask = task;
+  return details;
+}
+
+function upsertPromptDraft(task: CodexTaskState, draft: PromptDraft): CodexTaskState {
+  const prompts = task.prompts.filter((item) => item.round !== draft.round);
+  prompts.push(draft);
+  prompts.sort((left, right) => left.round - right.round);
+  return {
+    ...task,
+    prompts,
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+function upsertTaskRound(task: CodexTaskState, round: CodexTaskRound): CodexTaskState {
+  const rounds = task.rounds.filter((item) => item.round !== round.round);
+  rounds.push(round);
+  rounds.sort((left, right) => left.round - right.round);
+  return {
+    ...task,
+    rounds,
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+function promptForRound(task: CodexTaskState, round: number): string | undefined {
+  return task.prompts.find((item) => item.round === round)?.prompt;
+}
+
+function roundForTask(task: CodexTaskState, round: number): CodexTaskRound | undefined {
+  return task.rounds.find((item) => item.round === round);
+}
+
+function pickPrimaryIssue(issues: any[], row: any): CodexIssueSource {
+  const source = issues[0];
+  if (source) {
+    return {
+      owner: asNonEmptyString(source.owner),
+      repo: asNonEmptyString(source.repo),
+      number: Number.isFinite(Number(source.number)) ? Number(source.number) : undefined,
+      url: asNonEmptyString(source.url),
+      title: asNonEmptyString(source.title) ?? `Issue #${source.number}`,
+      body: asNonEmptyString(source.body),
+      selectedFromCount: issues.length,
+    };
+  }
+  return {
+    title: asNonEmptyString(row.pr_title) ?? "Resolve the linked issue",
+    body: undefined,
+    selectedFromCount: 1,
+  };
+}
+
+async function resolveCodexPrContext(github: GitHubClient, row: any): Promise<CodexPrContext | undefined> {
+  if (!row.pr_number) {
+    return undefined;
+  }
+  const repo = toSearchRepo(row);
+  const [pullRequest, files] = await Promise.all([
+    github.getPullRequest(repo, Number(row.pr_number)),
+    github.listPullRequestFiles(repo, Number(row.pr_number)).catch(() => []),
+  ]);
+  if (!pullRequest && files.length === 0) {
+    if (!row.pr_title && !row.pr_url) return undefined;
+  }
+  return {
+    number: Number(row.pr_number),
+    url: pullRequest?.url ?? asNonEmptyString(row.pr_url),
+    title: pullRequest?.title ?? asNonEmptyString(row.pr_title),
+    body: pullRequest?.body,
+    mergedAt: pullRequest?.mergedAt ?? undefined,
+    changedFilesCount: pullRequest?.changedFilesCount ?? files.length,
+    changedFiles: summarizePullRequestFiles(files),
+    fetchedAt: new Date().toISOString(),
+  };
+}
+
+function reviewArtifactDir(config: Config, candidateId: number, round: number): string {
+  return resolve(config.outputRoot, "codex-reviews", `candidate-${candidateId}`, `round-${round}`);
+}
+
+function assertAbsoluteExistingPath(pathValue: unknown, label: string): string {
+  const value = asNonEmptyString(pathValue);
+  if (!value) {
+    throw new RequestValidationError(`${label} is required`);
+  }
+  if (!isAbsolute(value)) {
+    throw new RequestValidationError(`${label} must be an absolute path`);
+  }
+  if (!existsSync(value)) {
+    throw new RequestValidationError(`${label} does not exist`);
+  }
+  return value;
+}
+
+async function assertGitRepository(pathValue: string, label: string): Promise<void> {
+  const result = await runCommand({
+    cmd: "git",
+    args: ["-C", pathValue, "rev-parse", "--show-toplevel"],
+    timeoutMs: 15_000,
+  });
+  if (result.code !== 0) {
+    throw new RequestValidationError(`${label} is not a git repository`);
+  }
+}
+
+async function readCommandOutput(
+  cmd: string,
+  args: string[],
+  options: {
+    cwd?: string;
+    timeoutMs?: number;
+  } = {},
+): Promise<string> {
+  const result = await runCommand({
+    cmd,
+    args,
+    cwd: options.cwd,
+    timeoutMs: options.timeoutMs ?? 60_000,
+  });
+  const combined = `${result.stdout}\n${result.stderr}`.trim();
+  if (result.code !== 0) {
+    throw new Error(combined || `${cmd} ${args.join(" ")} failed`);
+  }
+  return result.stdout.trim() || combined;
 }
 
 function normalizeReviewStatus(value: unknown): "new" | "reviewing" | "approved" | "follow_up" {
@@ -445,6 +794,255 @@ export function createApp(config: Config): express.Express {
         activeAcceptedTestRunStates.delete(candidateId);
       }
     }, 15 * 60 * 1000);
+  };
+
+  const scheduleActiveCodexReviewCleanup = (candidateId: number, round: number): void => {
+    setTimeout(() => {
+      const key = codexReviewRunKey(candidateId, round);
+      const run = activeCodexReviewRunStates.get(key);
+      if (run && run.status !== "running") {
+        activeCodexReviewRunStates.delete(key);
+      }
+    }, 15 * 60 * 1000);
+  };
+
+  const persistCodexTask = (row: any, details: Record<string, unknown>, task: CodexTaskState): void => {
+    updateCodexTaskState(details, task);
+    updateScanCandidateState(db, Number(row.id), {
+      accepted: Boolean(row.accepted),
+      rejectionReasons: safeParseJson<string[]>(row.rejection_reasons, []),
+      testsUnableToRun: Boolean(row.tests_unable_to_run),
+      testsUnableToRunReason: typeof row.tests_unable_to_run_reason === "string" ? row.tests_unable_to_run_reason : undefined,
+      detailsJson: JSON.stringify(details),
+    });
+  };
+
+  const codexTaskPayload = (row: any, details: Record<string, unknown>) => {
+    const task = normalizeCodexTaskState(details);
+    return {
+      task,
+      activeReview: task
+        ? (activeCodexReviewRunStates.get(codexReviewRunKey(Number(row.id), task.currentRound))
+          ? codexReviewStateToApi(activeCodexReviewRunStates.get(codexReviewRunKey(Number(row.id), task.currentRound)) as ActiveCodexReviewRunState)
+          : null)
+        : null,
+    };
+  };
+
+  const collectCodexReviewEvidence = async (
+    task: CodexTaskState,
+    label: "A" | "B",
+    repoPath: string,
+    baselineHead: string,
+    testCommand: string | undefined,
+    notes: string | undefined,
+  ) => {
+    const warnings: string[] = [];
+    const safeRead = async (step: string, fn: () => Promise<string>, fallback = `${step} unavailable`): Promise<string> => {
+      try {
+        return await fn();
+      } catch (err) {
+        warnings.push(`${step}: ${err instanceof Error ? err.message : String(err)}`);
+        return fallback;
+      }
+    };
+
+    const gitStatus = await safeRead("git status", () => readCommandOutput("git", ["-C", repoPath, "status", "--short", "--branch"]));
+    const branch = await safeRead("branch", () => readCommandOutput("git", ["-C", repoPath, "rev-parse", "--abbrev-ref", "HEAD"]));
+    const head = await safeRead("head", () => readCommandOutput("git", ["-C", repoPath, "rev-parse", "HEAD"]));
+    const diffStat = await safeRead("diff stat", () => readCommandOutput("git", ["-C", repoPath, "diff", "--stat", baselineHead, "--", "."]), "diff stat unavailable");
+    const diffPatch = await safeRead("diff patch", () => readCommandOutput("git", ["-C", repoPath, "diff", "--binary", baselineHead, "--", "."]), "diff patch unavailable");
+    const log = await safeRead("git log", () => readCommandOutput("git", ["-C", repoPath, "log", "--oneline", "--decorate", "-5"]), "git log unavailable");
+    const tmuxCapture = await safeRead(
+      "tmux capture",
+      () => readCommandOutput("tmux", ["capture-pane", "-p", "-t", `${task.hfiUuid}-${label}`], { timeoutMs: 15_000 }),
+      "tmux capture unavailable",
+    );
+
+    let testExitCode: number | null | undefined;
+    let testOutput: string | undefined;
+    if (testCommand) {
+      const testResult = await runCommand({
+        cmd: "zsh",
+        args: ["-lc", testCommand],
+        cwd: repoPath,
+        timeoutMs: config.testTimeoutMs,
+      });
+      testExitCode = testResult.code;
+      testOutput = [
+        `$ ${testCommand}`,
+        "",
+        testResult.stdout ? `STDOUT\n${testResult.stdout.trim()}` : "",
+        testResult.stderr ? `STDERR\n${testResult.stderr.trim()}` : "",
+        `exit_code=${testResult.code}`,
+        testResult.timedOut ? "timed_out=true" : "",
+      ].filter(Boolean).join("\n\n");
+    }
+
+    return {
+      label,
+      repoPath,
+      gitStatus,
+      branch,
+      head,
+      diffStat,
+      diffPatch,
+      log,
+      tmuxCapture,
+      testCommand,
+      testExitCode,
+      testOutput,
+      notes,
+      warnings,
+    };
+  };
+
+  const runCodexTaskReview = async (
+    row: any,
+    runState: ActiveCodexReviewRunState,
+    details: Record<string, unknown>,
+    task: CodexTaskState,
+    notesA: string | undefined,
+    notesB: string | undefined,
+  ): Promise<void> => {
+    const round = runState.round;
+    const artifactDir = reviewArtifactDir(config, runState.candidateId, round);
+    runState.artifactDir = artifactDir;
+    appendCodexReviewLog(runState, `Preparing Codex review bundle for round ${round}`);
+
+    try {
+      const baselineHead = await readCommandOutput("git", ["-C", task.originalRepoPath, "rev-parse", "HEAD"]);
+      const currentPrompt = promptForRound(task, round) ?? buildFollowUpPrompt(round, []);
+      appendCodexReviewLog(runState, "Collecting A/B evidence");
+
+      const [responseA, responseB, prContext] = await Promise.all([
+        collectCodexReviewEvidence(task, "A", task.worktreeAPath, baselineHead, task.testCommand, notesA),
+        collectCodexReviewEvidence(task, "B", task.worktreeBPath, baselineHead, task.testCommand, notesB),
+        task.prContext ? Promise.resolve(task.prContext) : resolveCodexPrContext(github, row),
+      ]);
+
+      writeReviewBundle(artifactDir, {
+        round,
+        maxPrompts: task.maxPrompts,
+        issue: task.issue,
+        prContext,
+        currentPrompt,
+        originalRepoPath: task.originalRepoPath,
+        worktreeAPath: task.worktreeAPath,
+        worktreeBPath: task.worktreeBPath,
+        testCommand: task.testCommand,
+        screening: asRecord(details.screening) ?? null,
+        analysis: asRecord(details.analysis) ?? null,
+        previousRound: round > 1 ? roundForTask(task, round - 1) : undefined,
+        responseA,
+        responseB,
+      });
+      appendCodexReviewLog(runState, "Evidence bundle saved");
+
+      const schemaPath = join(artifactDir, "review-output.schema.json");
+      const outputPath = join(artifactDir, "codex-last-message.json");
+      const promptPath = join(artifactDir, "codex-instructions.txt");
+      const codexPrompt = buildCodexReviewPrompt({
+        round,
+        maxPrompts: task.maxPrompts,
+        issue: task.issue,
+        prContext,
+        currentPrompt,
+        originalRepoPath: task.originalRepoPath,
+        worktreeAPath: task.worktreeAPath,
+        worktreeBPath: task.worktreeBPath,
+        testCommand: task.testCommand,
+        screening: asRecord(details.screening) ?? null,
+        analysis: asRecord(details.analysis) ?? null,
+        previousRound: round > 1 ? roundForTask(task, round - 1) : undefined,
+        responseA,
+        responseB,
+      });
+      writeFileSync(promptPath, codexPrompt, "utf8");
+      appendCodexReviewLog(runState, "Running local Codex review");
+
+      const codexResult = await runCommand({
+        cmd: "codex",
+        args: [
+          "exec",
+          "-C",
+          artifactDir,
+          "-s",
+          "read-only",
+          "--skip-git-repo-check",
+          "--output-schema",
+          schemaPath,
+          "-o",
+          outputPath,
+          "--add-dir",
+          task.originalRepoPath,
+          "--add-dir",
+          task.worktreeAPath,
+          "--add-dir",
+          task.worktreeBPath,
+          "-",
+        ],
+        stdinText: codexPrompt,
+        timeoutMs: Math.max(config.testTimeoutMs, 10 * 60 * 1000),
+        onStdoutChunk: (chunk) => appendCodexReviewOutput(runState, "stdout", chunk),
+        onStderrChunk: (chunk) => appendCodexReviewOutput(runState, "stderr", chunk),
+      });
+
+      if (codexResult.code !== 0) {
+        throw new Error(`${codexResult.stderr || codexResult.stdout || "codex exec failed"}`.trim());
+      }
+
+      const rawOutput = readUtf8Safe(outputPath) ?? codexResult.stdout;
+      let reviewDraft: CodexReviewDraft;
+      try {
+        reviewDraft = parseCodexReviewOutput(rawOutput);
+      } catch (err) {
+        appendCodexReviewLog(runState, `Codex output parsing failed, generating fallback draft: ${err instanceof Error ? err.message : String(err)}`);
+        reviewDraft = createFallbackReviewDraft(
+          round,
+          "A",
+          round > 1 ? (roundForTask(task, round - 1)?.reviewDraft?.winnerUnresolvedCons ?? []) : [],
+        );
+      }
+
+      reviewDraft.artifactDir = artifactDir;
+      reviewDraft.generatedAt = new Date().toISOString();
+      if (round < CODEX_TASK_MAX_PROMPTS && !reviewDraft.nextPrompt.trim()) {
+        reviewDraft.nextPrompt = buildFollowUpPrompt(round + 1, reviewDraft.winnerUnresolvedCons);
+      }
+      writeJson(join(artifactDir, "review-draft.json"), reviewDraft);
+
+      let updatedTask: CodexTaskState = {
+        ...task,
+        currentRound: round < CODEX_TASK_MAX_PROMPTS ? round + 1 : task.currentRound,
+        prContext,
+        updatedAt: new Date().toISOString(),
+      };
+      updatedTask = upsertTaskRound(updatedTask, {
+        round,
+        notesA,
+        notesB,
+        reviewDraft,
+        artifactDir,
+        generatedAt: reviewDraft.generatedAt,
+        promptGeneratedForNextRound: round < CODEX_TASK_MAX_PROMPTS ? round + 1 : undefined,
+      });
+      if (round < CODEX_TASK_MAX_PROMPTS) {
+        updatedTask = upsertPromptDraft(updatedTask, makePromptDraft(round + 1, reviewDraft.nextPrompt, "review_follow_up"));
+      }
+      persistCodexTask(row, details, updatedTask);
+
+      runState.status = "completed";
+      runState.finishedAt = new Date().toISOString();
+      appendCodexReviewLog(runState, "Codex review completed");
+    } catch (err) {
+      runState.status = "failed";
+      runState.finishedAt = new Date().toISOString();
+      runState.error = err instanceof Error ? err.message : String(err);
+      appendCodexReviewLog(runState, `Codex review failed: ${runState.error}`);
+    } finally {
+      scheduleActiveCodexReviewCleanup(runState.candidateId, round);
+    }
   };
 
   const runAcceptedTestRun = async (
@@ -857,11 +1455,233 @@ export function createApp(config: Config): express.Express {
       activeTestRun: activeAcceptedTestRunStates.has(Number(row.id))
         ? rerunStateToApi(activeAcceptedTestRunStates.get(Number(row.id)) as ActiveAcceptedTestRunState)
         : null,
+      activeCodexReview: (() => {
+        const details = safeParseJson<Record<string, unknown>>(row.details_json, {});
+        const task = normalizeCodexTaskState(details);
+        if (!task) return null;
+        const active = activeCodexReviewRunStates.get(codexReviewRunKey(Number(row.id), task.currentRound));
+        return active ? codexReviewStateToApi(active) : null;
+      })(),
     }));
     res.json({
       total: data.total,
       rows,
     });
+  });
+
+  app.post("/api/accepted/:id/start-task", async (req, res) => {
+    const candidateId = Number(req.params.id);
+    if (!Number.isFinite(candidateId)) {
+      return res.status(400).json({ error: "invalid candidate id" });
+    }
+
+    const row = getScanCandidateById(db, candidateId);
+    if (!row) {
+      return res.status(404).json({ error: "accepted candidate not found" });
+    }
+    if (!row.accepted) {
+      return res.status(409).json({ error: "candidate is not currently accepted" });
+    }
+
+    const requestBody = asRecord(req.body) ?? {};
+    const hfiUuid = asNonEmptyString(requestBody.hfiUuid);
+    if (!hfiUuid) {
+      return res.status(400).json({ error: "HFI UUID is required" });
+    }
+
+    try {
+      const originalRepoPath = assertAbsoluteExistingPath(requestBody.originalRepoPath, "Original repo path");
+      const worktreeAPath = assertAbsoluteExistingPath(requestBody.worktreeAPath, "Worktree A path");
+      const worktreeBPath = assertAbsoluteExistingPath(requestBody.worktreeBPath, "Worktree B path");
+      const testCommand = asNonEmptyString(requestBody.testCommand);
+      if (worktreeAPath === worktreeBPath) {
+        throw new RequestValidationError("Worktree A path and Worktree B path must be different");
+      }
+      if (originalRepoPath === worktreeAPath || originalRepoPath === worktreeBPath) {
+        throw new RequestValidationError("Original repo path must be different from the A and B worktree paths");
+      }
+
+      await Promise.all([
+        assertGitRepository(originalRepoPath, "Original repo path"),
+        assertGitRepository(worktreeAPath, "Worktree A path"),
+        assertGitRepository(worktreeBPath, "Worktree B path"),
+      ]);
+
+      const details = safeParseJson<Record<string, unknown>>(row.details_json, {});
+      const issues = getIssuesForCandidate(db, candidateId);
+      const issue = pickPrimaryIssue(issues, row);
+      const prContext = await resolveCodexPrContext(github, row);
+      const promptOne = buildPromptOne(issue);
+      const task: CodexTaskState = {
+        hfiUuid,
+        originalRepoPath,
+        worktreeAPath,
+        worktreeBPath,
+        testCommand,
+        currentRound: 1,
+        maxPrompts: CODEX_TASK_MAX_PROMPTS,
+        startedAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        issue,
+        prContext,
+        prompts: [makePromptDraft(1, promptOne, "issue_rewrite")],
+        rounds: [],
+      };
+      persistCodexTask(row, details, task);
+      const updated = getScanCandidateById(db, candidateId);
+      const updatedDetails = safeParseJson<Record<string, unknown>>(updated.details_json, {});
+      return res.json({
+        ...codexTaskPayload(updated, updatedDetails),
+        tmux: buildTmuxSessionInfo(hfiUuid),
+      });
+    } catch (err) {
+      const status = err instanceof RequestValidationError ? 400 : 500;
+      return res.status(status).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.get("/api/accepted/:id/codex-task", (req, res) => {
+    const candidateId = Number(req.params.id);
+    if (!Number.isFinite(candidateId)) {
+      return res.status(400).json({ error: "invalid candidate id" });
+    }
+    const row = getScanCandidateById(db, candidateId);
+    if (!row) {
+      return res.status(404).json({ error: "accepted candidate not found" });
+    }
+    const details = safeParseJson<Record<string, unknown>>(row.details_json, {});
+    const payload = codexTaskPayload(row, details);
+    if (!payload.task) {
+      return res.status(404).json({ error: "codex task has not been started for this candidate" });
+    }
+    return res.json({
+      ...payload,
+      tmux: buildTmuxSessionInfo(payload.task.hfiUuid),
+    });
+  });
+
+  app.post("/api/accepted/:id/codex-task/round/:round/review", async (req, res) => {
+    const candidateId = Number(req.params.id);
+    const round = Number(req.params.round);
+    if (!Number.isFinite(candidateId) || !Number.isFinite(round)) {
+      return res.status(400).json({ error: "invalid candidate id or round" });
+    }
+    if (round < 1 || round > CODEX_TASK_MAX_PROMPTS) {
+      return res.status(400).json({ error: `round must be between 1 and ${CODEX_TASK_MAX_PROMPTS}` });
+    }
+    const key = codexReviewRunKey(candidateId, round);
+    const existing = activeCodexReviewRunStates.get(key);
+    if (existing?.status === "running") {
+      return res.status(409).json({ error: "a Codex review is already running for this round" });
+    }
+
+    const codexCheck = await runCommand({ cmd: "which", args: ["codex"], timeoutMs: 15_000 });
+    if (codexCheck.code !== 0) {
+      return res.status(400).json({ error: "local codex CLI was not found in PATH" });
+    }
+
+    const row = getScanCandidateById(db, candidateId);
+    if (!row) {
+      return res.status(404).json({ error: "accepted candidate not found" });
+    }
+    const details = safeParseJson<Record<string, unknown>>(row.details_json, {});
+    const task = normalizeCodexTaskState(details);
+    if (!task) {
+      return res.status(409).json({ error: "start the Codex task before generating a review" });
+    }
+    if (round !== task.currentRound) {
+      return res.status(409).json({ error: `round ${task.currentRound} is the next available review round` });
+    }
+    if (!promptForRound(task, round)) {
+      return res.status(409).json({ error: `no prompt is saved for round ${round}` });
+    }
+
+    const requestBody = asRecord(req.body) ?? {};
+    const notesA = asNonEmptyString(requestBody.notesA);
+    const notesB = asNonEmptyString(requestBody.notesB);
+    const runState: ActiveCodexReviewRunState = {
+      candidateId,
+      round,
+      status: "running",
+      stage: "Queued Codex review",
+      startedAt: new Date().toISOString(),
+      logs: [],
+      liveOutput: "",
+    };
+    activeCodexReviewRunStates.set(key, runState);
+    appendCodexReviewLog(runState, "Queued Codex review");
+
+    void runCodexTaskReview(row, runState, details, task, notesA, notesB);
+    return res.status(202).json(codexReviewStateToApi(runState));
+  });
+
+  app.post("/api/accepted/:id/codex-task/round/:round/save-draft", (req, res) => {
+    const candidateId = Number(req.params.id);
+    const round = Number(req.params.round);
+    if (!Number.isFinite(candidateId) || !Number.isFinite(round)) {
+      return res.status(400).json({ error: "invalid candidate id or round" });
+    }
+
+    const row = getScanCandidateById(db, candidateId);
+    if (!row) {
+      return res.status(404).json({ error: "accepted candidate not found" });
+    }
+    const details = safeParseJson<Record<string, unknown>>(row.details_json, {});
+    const task = normalizeCodexTaskState(details);
+    if (!task) {
+      return res.status(409).json({ error: "start the Codex task before saving a draft" });
+    }
+
+    const requestBody = asRecord(req.body) ?? {};
+    const winner = requestBody.winner === "B" ? "B" : "A";
+    const draft = normalizeCodexReviewDraft({
+      winner,
+      modelA: asRecord(requestBody.modelA) ?? {},
+      modelB: asRecord(requestBody.modelB) ?? {},
+      axes: asRecord(requestBody.axes) ?? {},
+      overallJustification: requestBody.overallJustification,
+      winnerUnresolvedCons: requestBody.winnerUnresolvedCons,
+      nextPrompt: requestBody.nextPrompt,
+      confidenceNotes: requestBody.confidenceNotes,
+      generatedAt: new Date().toISOString(),
+      artifactDir: requestBody.artifactDir,
+    });
+    if (!draft) {
+      return res.status(400).json({ error: "review draft payload is invalid" });
+    }
+
+    let updatedTask = upsertTaskRound(task, {
+      round,
+      notesA: roundForTask(task, round)?.notesA,
+      notesB: roundForTask(task, round)?.notesB,
+      reviewDraft: draft,
+      artifactDir: draft.artifactDir,
+      generatedAt: new Date().toISOString(),
+      promptGeneratedForNextRound: round < CODEX_TASK_MAX_PROMPTS ? round + 1 : undefined,
+    });
+    if (round < CODEX_TASK_MAX_PROMPTS && draft.nextPrompt.trim()) {
+      updatedTask = upsertPromptDraft(updatedTask, makePromptDraft(round + 1, draft.nextPrompt, "review_follow_up"));
+    }
+    persistCodexTask(row, details, updatedTask);
+    const updated = getScanCandidateById(db, candidateId);
+    const updatedDetails = safeParseJson<Record<string, unknown>>(updated.details_json, {});
+    return res.json({
+      ...codexTaskPayload(updated, updatedDetails),
+      tmux: buildTmuxSessionInfo(updatedTask.hfiUuid),
+    });
+  });
+
+  app.get("/api/accepted/:id/codex-task/round/:round/status", (req, res) => {
+    const candidateId = Number(req.params.id);
+    const round = Number(req.params.round);
+    if (!Number.isFinite(candidateId) || !Number.isFinite(round)) {
+      return res.status(400).json({ error: "invalid candidate id or round" });
+    }
+    const run = activeCodexReviewRunStates.get(codexReviewRunKey(candidateId, round));
+    if (!run) {
+      return res.json({ candidateId, round, running: false, status: "idle", logs: [], liveOutput: "" });
+    }
+    return res.json(codexReviewStateToApi(run));
   });
 
   app.get("/api/accepted/:id/dockerfile", async (req, res) => {

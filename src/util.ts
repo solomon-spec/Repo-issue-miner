@@ -69,6 +69,7 @@ export async function runCommand(options: {
   cwd?: string;
   timeoutMs?: number;
   env?: NodeJS.ProcessEnv;
+  stdinText?: string;
   stdoutPath?: string;
   stderrPath?: string;
   signal?: AbortSignal;
@@ -84,7 +85,7 @@ export async function runCommand(options: {
   const child = spawn(options.cmd, options.args, {
     cwd: options.cwd,
     env: options.env,
-    stdio: ["ignore", "pipe", "pipe"],
+    stdio: ["pipe", "pipe", "pipe"],
   });
   let timedOut = false;
   let aborted = false;
@@ -110,6 +111,11 @@ export async function runCommand(options: {
     stderrStream?.write(chunk);
     options.onStderrChunk?.(buffer.toString("utf8"));
   });
+
+  if (typeof options.stdinText === "string") {
+    child.stdin.write(options.stdinText, "utf8");
+  }
+  child.stdin.end();
 
   const abortHandler = () => {
     aborted = true;

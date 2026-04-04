@@ -635,6 +635,29 @@ export class GitHubClient {
     return files;
   }
 
+  async getPullRequest(repo: SearchRepo, prNumber: number): Promise<{
+    number: number;
+    url?: string;
+    title?: string;
+    body?: string;
+    mergedAt?: string | null;
+    changedFilesCount?: number;
+  } | undefined> {
+    try {
+      const pr = await this.rest<Record<string, unknown>>(`/repos/${repo.owner}/${repo.name}/pulls/${prNumber}`);
+      return {
+        number: prNumber,
+        url: typeof pr.html_url === "string" ? pr.html_url : undefined,
+        title: typeof pr.title === "string" ? pr.title : undefined,
+        body: typeof pr.body === "string" ? pr.body : undefined,
+        mergedAt: typeof pr.merged_at === "string" ? pr.merged_at : undefined,
+        changedFilesCount: typeof pr.changed_files === "number" ? pr.changed_files : undefined,
+      };
+    } catch {
+      return undefined;
+    }
+  }
+
   async getRepoTree(repo: SearchRepo, ref: string): Promise<RepoTreeItem[]> {
     const response = await this.rest<{ tree: Array<{ path: string; type: string; size?: number }> }>(
       `/repos/${repo.owner}/${repo.name}/git/trees/${encodeURIComponent(ref)}?recursive=1`,
