@@ -23,7 +23,7 @@
   }
 
   function badgeClassForStatus(status) {
-    return { running: "badge-running", completed: "badge-completed", failed: "badge-failed" }[status] || "badge-warn";
+    return { running: "badge-running", completed: "badge-completed", failed: "badge-failed", stopped: "badge-warn" }[status] || "badge-warn";
   }
 
   function statusBadge(status) {
@@ -185,12 +185,22 @@
   }
 
   /* ---- Navigation ---- */
-  const pages = ["dashboard", "repos", "accepted", "issues", "scans", "new-scan"];
+  const pages = ["dashboard", "repos", "setup", "accepted", "issues", "scans", "new-scan"];
   let currentPage = "dashboard";
   const selectedRepoIds = new Set();
   let visibleRepoIds = [];
+  let selectedSetupTarget = null;
+  let setupProfilesCache = [];
+  let selectedSetupRunId = null;
+  let editingSetupProfileId = null;
+  let setupProfileAutoSelectPending = true;
+  let setupRunPoller = null;
+  let setupRunPollInFlight = false;
 
   function switchPage(page) {
+    if (page !== "setup") {
+      stopSetupRunPolling();
+    }
     currentPage = page;
     pages.forEach((p) => {
       const el = $(`#page-${p}`);
@@ -259,6 +269,72 @@
     $("#f-merged-after").value = "";
   }
 
+  function prepareRepoSetup(repo) {
+    if (!repo?.id) return;
+    setupProfileAutoSelectPending = true;
+    selectedSetupTarget = {
+      type: "repo",
+      id: Number(repo.id),
+      repoId: Number(repo.id),
+      fullName: repo.fullName || repo.full_name || "Unknown Repo",
+      stars: typeof repo.stars === "number" ? repo.stars : Number(repo.stars || 0),
+      language: repo.primary_language || repo.primaryLanguage || "",
+      description: repo.description || "",
+      setupNote: "Setup runs against a fresh snapshot of the repository default branch and only prepares the codebase for later work.",
+      label: repo.fullName || repo.full_name || "Unknown Repo",
+    };
+    selectedSetupRunId = null;
+    switchPage("setup");
+  }
+
+  function prepareIssueSetup(issue) {
+    if (!issue?.id) return;
+    setupProfileAutoSelectPending = true;
+    selectedSetupTarget = {
+      type: "issue",
+      id: Number(issue.id),
+      repoId: Number(issue.repo_id),
+      fullName: issue.repo_full_name || "Unknown Repo",
+      stars: typeof issue.repo_stars === "number" ? issue.repo_stars : Number(issue.repo_stars || 0),
+      language: issue.repo_primary_language || "",
+      description: issue.repo_description || "",
+      setupNote: "Setup runs against the linked fix PR base/pre-fix commit and does not implement the issue yet.",
+      issueNumber: typeof issue.number === "number" ? issue.number : Number(issue.number || 0),
+      issueTitle: issue.title || "",
+      label: `${issue.repo_full_name} issue #${issue.number}${issue.title ? `: ${issue.title}` : ""}`,
+    };
+    selectedSetupRunId = null;
+    switchPage("setup");
+  }
+
+  function prepareAcceptedSetup(row) {
+    if (!row) return;
+    const issues = Array.isArray(row.issues)
+      ? row.issues.filter((issue) => Number.isFinite(Number(issue?.id)))
+      : [];
+
+    if (issues.length === 1) {
+      const issue = issues[0];
+      prepareIssueSetup({
+        ...issue,
+        repo_id: Number(row.repo_id),
+        repo_full_name: row.repo_full_name || "",
+        repo_stars: typeof row.repo_stars === "number" ? row.repo_stars : Number(row.repo_stars || 0),
+        repo_primary_language: row.repo_primary_language || "",
+        repo_description: row.repo_description || "",
+      });
+      return;
+    }
+
+    prepareRepoSetup({
+      id: Number(row.repo_id),
+      fullName: row.repo_full_name || "",
+      stars: typeof row.repo_stars === "number" ? row.repo_stars : Number(row.repo_stars || 0),
+      primary_language: row.repo_primary_language || "",
+      description: row.repo_description || "",
+    });
+  }
+
   /* ---- Dashboard ---- */
   async function loadDashboard() {
     try {
@@ -317,6 +393,17 @@
     selectAll.indeterminate = selectedVisible > 0 && selectedVisible < rowIds.length;
   }
 
+  function renderRepoPrProgress(repo) {
+    const passed = Number(repo?.basic_filter_pass_count) || 0;
+    const scanned = Number(repo?.scanned_pr_count) || 0;
+    return `
+      <div class="repo-pr-progress" title="Passed basic filter / scanned pull requests">
+        <strong>${passed}/${scanned}</strong>
+        <span>passed / scanned</span>
+      </div>
+    `;
+  }
+
   async function loadRepos(search) {
     try {
       const params = new URLSearchParams({ limit: REPOS_PER_PAGE, offset: reposPage * REPOS_PER_PAGE });
@@ -338,10 +425,11 @@
           <td><a class="repo-link" data-repo-id="${r.id}">${esc(r.full_name)}</a></td>
           <td>⭐ ${r.stars}</td>
           <td>${esc(r.primary_language || "—")}</td>
-          <td>${r.pr_count}</td>
+          <td>${renderRepoPrProgress(r)}</td>
           <td>${r.issue_count}</td>
           <td>${r.accepted_count > 0 ? '<span class="badge badge-accepted">✅ Accepted</span>' : '<span class="badge badge-rejected">❌ Rejected</span>'}</td>
           <td>
+            <button class="btn btn-sm" data-setup-repo="${r.id}" data-setup-repo-name="${esc(r.full_name)}">Setup</button>
             <button class="btn btn-sm btn-info" data-deep-scan-repo="${esc(r.full_name)}">Deep Scan</button>
             <button class="btn btn-sm btn-danger" data-delete-repo="${r.id}">Delete</button>
           </td>
@@ -381,6 +469,15 @@
         });
       });
 
+      $$("[data-setup-repo]", tbody).forEach((btn) => {
+        btn.addEventListener("click", () => {
+          prepareRepoSetup({
+            id: Number(btn.dataset.setupRepo),
+            fullName: btn.dataset.setupRepoName,
+          });
+        });
+      });
+
       updateRepoBulkDeleteUI(data.rows);
     } catch (err) {
       $("#repos-tbody").innerHTML = `<tr><td colspan="8"><div class="empty-state"><p>Error: ${err.message}</p></div></td></tr>`;
@@ -399,7 +496,10 @@
       body.innerHTML = `
         <div style="display:flex; gap:0.75rem; align-items:center; justify-content:space-between; flex-wrap:wrap; margin-bottom:1rem;">
           <h2 style="margin:0;">${esc(data.full_name)}</h2>
-          <button type="button" class="btn btn-info" data-modal-deep-scan="${esc(data.full_name)}">Deep Scan This Repo</button>
+          <div style="display:flex; gap:0.6rem; flex-wrap:wrap;">
+            <button type="button" class="btn" data-modal-setup="${data.id}" data-modal-setup-name="${esc(data.full_name)}">Setup This Repo</button>
+            <button type="button" class="btn btn-info" data-modal-deep-scan="${esc(data.full_name)}">Deep Scan This Repo</button>
+          </div>
         </div>
         <div class="detail-section">
           <h4>Info</h4>
@@ -473,6 +573,19 @@
           prepareSingleRepoDeepScan(deepScanButton.dataset.modalDeepScan);
         });
       }
+      const setupButton = $("[data-modal-setup]", body);
+      if (setupButton) {
+        setupButton.addEventListener("click", () => {
+          $("#repo-detail-modal").classList.add("hidden");
+          prepareRepoSetup({
+            id: Number(setupButton.dataset.modalSetup),
+            fullName: setupButton.dataset.modalSetupName,
+            stars: data.stars,
+            primary_language: data.primary_language,
+            description: data.description,
+          });
+        });
+      }
       attachManualReproCopyHandlers(body);
     } catch (err) {
       body.innerHTML = `<p>Error: ${err.message}</p>`;
@@ -516,6 +629,479 @@
     } catch (err) {
       alert("Failed to delete selected repos: " + err.message);
       updateRepoBulkDeleteUI(visibleRepoIds.map((id) => ({ id })));
+    }
+  });
+
+  /* ---- Setup ---- */
+  function renderSetupSelectedRepo() {
+    const container = $("#setup-selected-target");
+    const startButton = $("#setup-start-button");
+    if (!container || !startButton) return;
+
+    if (!selectedSetupTarget) {
+      container.innerHTML = `
+        <strong>No target selected</strong>
+        <span>Choose \`Setup\` from the repo list or the issues list to target a repository or a specific issue.</span>
+      `;
+      startButton.disabled = true;
+      return;
+    }
+
+    const targetBadge = selectedSetupTarget.type === "issue"
+      ? `Issue #${selectedSetupTarget.issueNumber || "?"}`
+      : "Repository";
+    const setupNote = selectedSetupTarget.setupNote
+      || (selectedSetupTarget.type === "issue"
+        ? "Setup runs against the linked fix PR base/pre-fix commit and does not implement the issue yet."
+        : "Setup runs against a fresh snapshot of the repository default branch and only prepares the codebase for later work.");
+    const repoDescription = typeof selectedSetupTarget.description === "string" && selectedSetupTarget.description.trim()
+      ? `<span>${esc(selectedSetupTarget.description.trim())}</span>`
+      : "";
+
+    container.innerHTML = `
+      <strong>${esc(selectedSetupTarget.label || selectedSetupTarget.fullName)}</strong>
+      <span>${esc(targetBadge)} • ${selectedSetupTarget.language ? esc(selectedSetupTarget.language) : "Language unknown"}${selectedSetupTarget.stars ? ` • ⭐ ${selectedSetupTarget.stars}` : ""}</span>
+      <span>${esc(setupNote)}</span>
+      ${repoDescription}
+    `;
+    startButton.disabled = setupProfilesCache.length === 0;
+  }
+
+  function renderSetupProfileSelect() {
+    const select = $("#setup-profile-select");
+    if (!select) return;
+    const currentValue = Number(select.value);
+
+    if (!setupProfilesCache.length) {
+      select.innerHTML = `<option value="">No profiles yet</option>`;
+      select.disabled = true;
+      return;
+    }
+
+    select.disabled = false;
+    select.innerHTML = setupProfilesCache.map((profile) => `
+      <option value="${profile.id}">${esc(profile.name)}</option>
+    `).join("");
+
+    const normalizedLanguage = typeof selectedSetupTarget?.language === "string"
+      ? selectedSetupTarget.language.trim().toLowerCase()
+      : "";
+    const recommendedName = normalizedLanguage.includes("typescript")
+      ? "TypeScript Initial Setup"
+      : (normalizedLanguage.includes("javascript")
+        ? "JavaScript Initial Setup"
+        : "Python Initial Setup");
+    const recommendedProfile = setupProfilesCache.find((profile) => profile.name === recommendedName)
+      || setupProfilesCache.find((profile) => profile.name === "Python Initial Setup")
+      || setupProfilesCache[0];
+    const nextValue = (!setupProfileAutoSelectPending && setupProfilesCache.some((profile) => profile.id === currentValue))
+      ? currentValue
+      : recommendedProfile.id;
+    select.value = String(nextValue);
+    setupProfileAutoSelectPending = false;
+  }
+
+  function populateSetupProfileForm(profile) {
+    $("#setup-profile-id").value = profile?.id ? String(profile.id) : "";
+    $("#setup-profile-name").value = profile?.name || "";
+    $("#setup-profile-model").value = profile?.model || "";
+    $("#setup-profile-clone-root").value = profile?.cloneRootPath || "";
+    $("#setup-profile-sandbox").value = profile?.sandboxMode || "workspace-write";
+    $("#setup-profile-prompt").value = profile?.prompt || "";
+    $("#setup-profile-context-paths").value = Array.isArray(profile?.contextPaths) ? profile.contextPaths.join("\n") : "";
+    $("#setup-profile-writable-paths").value = Array.isArray(profile?.writablePaths) ? profile.writablePaths.join("\n") : "";
+    $("#setup-profile-validation-prompt").value = profile?.validationPrompt || "";
+    $("#setup-profile-editor-title").textContent = profile?.id ? `Edit Profile: ${profile.name}` : "New Profile";
+    $("#setup-delete-profile").disabled = !profile?.id;
+  }
+
+  function renderSetupProfileList() {
+    const container = $("#setup-profile-list");
+    if (!container) return;
+
+    if (!setupProfilesCache.length) {
+      container.innerHTML = `<div class="empty-state"><div class="empty-icon">🧩</div><p>Create a setup profile to tell Codex which files to read, what it can edit, and how it should validate the setup.</p></div>`;
+      return;
+    }
+
+    container.innerHTML = setupProfilesCache.map((profile) => `
+      <button
+        type="button"
+        class="setup-profile-item ${editingSetupProfileId === profile.id ? "active" : ""}"
+        data-setup-profile-edit="${profile.id}"
+      >
+        <strong>${esc(profile.name)}</strong>
+        <span>${esc(profile.sandboxMode === "danger-full-access" ? "Danger full access" : "Workspace write")}</span>
+        <small>${profile.contextPaths.length} context paths • ${profile.writablePaths.length} writable paths • ${profile.validationPrompt ? "validation prompt set" : "no validation prompt"} • ${esc(profile.cloneRootPath || "")}</small>
+      </button>
+    `).join("");
+
+    $$("[data-setup-profile-edit]", container).forEach((button) => {
+      button.addEventListener("click", () => {
+        const profileId = Number(button.dataset.setupProfileEdit);
+        const profile = setupProfilesCache.find((item) => item.id === profileId);
+        if (!profile) return;
+        editingSetupProfileId = profile.id;
+        populateSetupProfileForm(profile);
+        renderSetupProfileList();
+      });
+    });
+  }
+
+  function setupProfilePayloadFromForm() {
+    return {
+      name: $("#setup-profile-name").value.trim(),
+      model: $("#setup-profile-model").value.trim(),
+      cloneRootPath: $("#setup-profile-clone-root").value.trim(),
+      sandboxMode: $("#setup-profile-sandbox").value,
+      prompt: $("#setup-profile-prompt").value.trim(),
+      contextPaths: $("#setup-profile-context-paths").value,
+      writablePaths: $("#setup-profile-writable-paths").value,
+      validationPrompt: $("#setup-profile-validation-prompt").value.trim(),
+    };
+  }
+
+  async function loadSetupProfiles() {
+    setupProfilesCache = await api("/api/setup/profiles");
+    renderSetupProfileSelect();
+    renderSetupSelectedRepo();
+    if (editingSetupProfileId) {
+      const existing = setupProfilesCache.find((profile) => profile.id === editingSetupProfileId);
+      if (existing) {
+        populateSetupProfileForm(existing);
+      } else {
+        editingSetupProfileId = null;
+      }
+    }
+    if (!editingSetupProfileId) {
+      const firstProfile = setupProfilesCache[0] || null;
+      editingSetupProfileId = firstProfile?.id || null;
+      populateSetupProfileForm(firstProfile);
+    }
+    renderSetupProfileList();
+  }
+
+  function renderSetupChipList(items, emptyLabel, modifier = "") {
+    if (!Array.isArray(items) || !items.length) {
+      return `<span class="setup-chip muted">${esc(emptyLabel)}</span>`;
+    }
+    return items.map((item) => `<span class="setup-chip ${modifier}">${esc(item)}</span>`).join("");
+  }
+
+  function renderSetupRunsTable(runs) {
+    const tbody = $("#setup-runs-tbody");
+    if (!tbody) return;
+
+    if (!Array.isArray(runs) || !runs.length) {
+      tbody.innerHTML = `<tr><td colspan="7"><div class="empty-state"><div class="empty-icon">📝</div><p>No setup runs yet${selectedSetupTarget ? ` for ${esc(selectedSetupTarget.label || selectedSetupTarget.fullName)}` : ""}.</p></div></td></tr>`;
+      return;
+    }
+
+    tbody.innerHTML = runs.map((run) => `
+      <tr class="${selectedSetupRunId === run.id ? "setup-run-row-active" : ""}">
+        <td>#${run.id}</td>
+        <td>${esc(run.targetLabel || run.repoFullName)}</td>
+        <td>${esc(run.repoFullName)}</td>
+        <td>${esc(run.profileName || "Custom")}</td>
+        <td>${statusBadge(run.status)}</td>
+        <td>${fmtDate(run.startedAt)}</td>
+        <td>
+          <button type="button" class="btn btn-sm" data-view-setup-run="${run.id}">View</button>
+          ${run.status === "running" ? `<button type="button" class="btn btn-sm btn-danger" data-stop-setup-run="${run.id}">Stop</button>` : ""}
+        </td>
+      </tr>
+    `).join("");
+
+    $$("[data-view-setup-run]", tbody).forEach((button) => {
+      button.addEventListener("click", async () => {
+        selectedSetupRunId = Number(button.dataset.viewSetupRun);
+        await loadSetupRunDetail(selectedSetupRunId);
+        renderSetupRunsTable(runs);
+      });
+    });
+
+    $$("[data-stop-setup-run]", tbody).forEach((button) => {
+      button.addEventListener("click", async () => {
+        button.disabled = true;
+        try {
+          await api(`/api/setup/runs/${button.dataset.stopSetupRun}/stop`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+          });
+          await refreshSetupRuns();
+        } catch (err) {
+          alert("Failed to stop setup run: " + err.message);
+          button.disabled = false;
+        }
+      });
+    });
+  }
+
+  function renderSetupRunDetail(run) {
+    const container = $("#setup-run-detail");
+    const stopButton = $("#setup-stop-run");
+    if (!container || !stopButton) return;
+
+    if (!run) {
+      stopButton.disabled = true;
+      container.innerHTML = `<div class="empty-state"><div class="empty-icon">🧪</div><p>Select a setup run to inspect its prompt, output, changed files, and diff.</p></div>`;
+      return;
+    }
+
+    stopButton.disabled = run.status !== "running";
+    stopButton.dataset.runId = String(run.id);
+    const consoleOutput = run.liveOutput || run.stdoutExcerpt || run.stderrExcerpt || run.lastMessage || "No terminal output captured yet.";
+    const worktreePath = run.worktreePath || "Not recorded yet";
+
+    container.innerHTML = `
+      <div class="setup-detail-grid">
+        <div class="setup-detail-summary">
+          <div class="setup-run-title">
+            <strong>Run #${run.id}</strong>
+            ${statusBadge(run.status)}
+            <span class="badge badge-info">${esc(run.profileName || "Custom")}</span>
+          </div>
+          <dl class="detail-kv setup-detail-meta">
+            <dt>Repo</dt><dd>${esc(run.repoFullName)}</dd>
+            <dt>Target</dt><dd>${esc(run.targetLabel || run.repoFullName)}</dd>
+            <dt>Started</dt><dd>${fmtDate(run.startedAt)}</dd>
+            <dt>Finished</dt><dd>${fmtDate(run.finishedAt)}</dd>
+            <dt>Clone Root</dt><dd><code>${esc(run.cloneRootPath || "—")}</code></dd>
+            <dt>Sandbox</dt><dd>${esc(run.sandboxMode)}</dd>
+            <dt>Model</dt><dd>${esc(run.model || "Default Codex CLI model")}</dd>
+            <dt>Worktree</dt><dd><code>${esc(worktreePath)}</code></dd>
+          </dl>
+          <p class="setup-summary-text">${esc(run.summary || run.error || "No summary available yet.")}</p>
+          <div class="setup-chip-list">${renderSetupChipList(run.changedFiles, "No changed files recorded")}</div>
+          <div class="setup-chip-list">${renderSetupChipList(run.violationFiles, "No out-of-scope file edits", "danger")}</div>
+        </div>
+        <div class="setup-detail-prompt">
+          <strong>Configured Scope</strong>
+          <p class="form-helper">Context files, writable paths, the validation prompt, and the clone root are copied into the run at start time.</p>
+          <div class="setup-detail-section">
+            <span class="setup-detail-label">Prompt</span>
+            <pre class="log-output log-output-compact">${esc(run.prompt || "")}</pre>
+          </div>
+          <div class="setup-detail-section">
+            <span class="setup-detail-label">Context Paths</span>
+            <div class="setup-chip-list">${renderSetupChipList(run.contextPaths, "No context paths configured")}</div>
+          </div>
+          <div class="setup-detail-section">
+            <span class="setup-detail-label">Writable Paths</span>
+            <div class="setup-chip-list">${renderSetupChipList(run.writablePaths, "No writable path restrictions configured")}</div>
+          </div>
+          <div class="setup-detail-section">
+            <span class="setup-detail-label">Validation Prompt</span>
+            <pre class="log-output log-output-compact">${esc(run.validationPrompt || "No validation prompt configured.")}</pre>
+          </div>
+        </div>
+      </div>
+      <div class="setup-output-stack">
+        <div class="setup-detail-section">
+          <span class="setup-detail-label">Terminal Output</span>
+          <pre class="log-output">${esc(consoleOutput)}</pre>
+        </div>
+        <div class="setup-detail-section">
+          <span class="setup-detail-label">Final Message</span>
+          <pre class="log-output log-output-compact">${esc(run.lastMessage || "No final message captured yet.")}</pre>
+        </div>
+        <div class="setup-detail-section">
+          <span class="setup-detail-label">Diff</span>
+          <pre class="log-output log-output-compact">${esc(run.diffExcerpt || "No diff captured yet.")}</pre>
+        </div>
+      </div>
+    `;
+  }
+
+  async function loadSetupRunDetail(runId) {
+    if (!runId) {
+      renderSetupRunDetail(null);
+      return null;
+    }
+    const data = await api(`/api/setup/runs/${runId}`);
+    renderSetupRunDetail(data);
+    return data;
+  }
+
+  function stopSetupRunPolling() {
+    if (setupRunPoller) {
+      clearInterval(setupRunPoller);
+      setupRunPoller = null;
+    }
+    setupRunPollInFlight = false;
+  }
+
+  function ensureSetupRunPolling(runs) {
+    const hasRunning = Array.isArray(runs) && runs.some((run) => run.status === "running");
+    if (!hasRunning || currentPage !== "setup") {
+      stopSetupRunPolling();
+      return;
+    }
+    if (setupRunPoller) return;
+    setupRunPoller = setInterval(async () => {
+      if (setupRunPollInFlight || currentPage !== "setup") return;
+      setupRunPollInFlight = true;
+      try {
+        await refreshSetupRuns();
+      } catch {
+        /* ignore transient setup polling errors */
+      } finally {
+        setupRunPollInFlight = false;
+      }
+    }, 2000);
+  }
+
+  async function refreshSetupRuns() {
+    const params = new URLSearchParams({ limit: "20" });
+    if (selectedSetupTarget?.type === "issue" && selectedSetupTarget?.id) {
+      params.set("issueId", String(selectedSetupTarget.id));
+    } else if (selectedSetupTarget?.repoId) {
+      params.set("repoId", String(selectedSetupTarget.repoId));
+    }
+    const data = await api(`/api/setup/runs?${params.toString()}`);
+    const runs = Array.isArray(data.rows) ? data.rows : [];
+    if (selectedSetupRunId && !runs.some((run) => run.id === selectedSetupRunId)) {
+      selectedSetupRunId = runs[0]?.id || null;
+    }
+    if (!selectedSetupRunId && runs.length) {
+      selectedSetupRunId = runs[0].id;
+    }
+    renderSetupRunsTable(runs);
+    ensureSetupRunPolling(runs);
+    if (selectedSetupRunId) {
+      await loadSetupRunDetail(selectedSetupRunId);
+    } else {
+      renderSetupRunDetail(null);
+    }
+  }
+
+  async function loadSetup() {
+    renderSetupSelectedRepo();
+    await loadSetupProfiles();
+    await refreshSetupRuns();
+  }
+
+  $("#setup-clear-target").addEventListener("click", async () => {
+    setupProfileAutoSelectPending = true;
+    selectedSetupTarget = null;
+    selectedSetupRunId = null;
+    renderSetupSelectedRepo();
+    await refreshSetupRuns();
+  });
+
+  $("#setup-profile-select").addEventListener("change", () => {
+    setupProfileAutoSelectPending = false;
+  });
+
+  $("#setup-new-profile").addEventListener("click", () => {
+    editingSetupProfileId = null;
+    populateSetupProfileForm(null);
+    renderSetupProfileList();
+  });
+
+  $("#setup-reset-profile").addEventListener("click", () => {
+    if (!editingSetupProfileId) {
+      populateSetupProfileForm(null);
+      return;
+    }
+    const profile = setupProfilesCache.find((item) => item.id === editingSetupProfileId);
+    populateSetupProfileForm(profile || null);
+  });
+
+  $("#setup-profile-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const submitButton = $("#setup-save-profile");
+    const payload = setupProfilePayloadFromForm();
+    const editingId = Number($("#setup-profile-id").value);
+    submitButton.disabled = true;
+    submitButton.textContent = editingId ? "Saving…" : "Creating…";
+    try {
+      const profile = await api(editingId ? `/api/setup/profiles/${editingId}` : "/api/setup/profiles", {
+        method: editingId ? "PUT" : "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      editingSetupProfileId = profile.id;
+      await loadSetupProfiles();
+    } catch (err) {
+      alert("Failed to save setup profile: " + err.message);
+    } finally {
+      submitButton.disabled = false;
+      submitButton.textContent = "Save Profile";
+    }
+  });
+
+  $("#setup-delete-profile").addEventListener("click", async () => {
+    const profileId = Number($("#setup-profile-id").value);
+    if (!profileId) return;
+    if (!confirm("Delete this setup profile? Existing runs will keep their copied prompt and file scopes.")) return;
+    const button = $("#setup-delete-profile");
+    button.disabled = true;
+    try {
+      await api(`/api/setup/profiles/${profileId}`, { method: "DELETE" });
+      editingSetupProfileId = null;
+      await loadSetupProfiles();
+    } catch (err) {
+      alert("Failed to delete setup profile: " + err.message);
+      button.disabled = false;
+    }
+  });
+
+  $("#setup-run-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    if (!selectedSetupTarget?.id) {
+      alert("Choose a repo or issue from the Repos or Issues page first.");
+      return;
+    }
+    const profileId = Number($("#setup-profile-select").value);
+    if (!profileId) {
+      alert("Create or select a setup profile first.");
+      return;
+    }
+    const button = $("#setup-start-button");
+    button.disabled = true;
+    button.textContent = "Starting…";
+    try {
+      const path = selectedSetupTarget.type === "issue"
+        ? `/api/issues/${selectedSetupTarget.id}/setup`
+        : `/api/repos/${selectedSetupTarget.id}/setup`;
+      const run = await api(path, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ profileId }),
+      });
+      selectedSetupRunId = run.id;
+      await refreshSetupRuns();
+    } catch (err) {
+      alert("Failed to start setup task: " + err.message);
+    } finally {
+      button.disabled = setupProfilesCache.length === 0 || !selectedSetupTarget?.id;
+      button.textContent = "Start Setup";
+    }
+  });
+
+  $("#setup-refresh-runs").addEventListener("click", async () => {
+    try {
+      await refreshSetupRuns();
+    } catch (err) {
+      alert("Failed to refresh setup runs: " + err.message);
+    }
+  });
+
+  $("#setup-stop-run").addEventListener("click", async () => {
+    const runId = Number($("#setup-stop-run").dataset.runId);
+    if (!runId) return;
+    const button = $("#setup-stop-run");
+    button.disabled = true;
+    try {
+      await api(`/api/setup/runs/${runId}/stop`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+      });
+      await refreshSetupRuns();
+    } catch (err) {
+      alert("Failed to stop setup run: " + err.message);
+      button.disabled = false;
     }
   });
 
@@ -855,6 +1441,7 @@
         const dockerfileReasoning = dockerTest.dockerfile.reasoningSummary
           ? `<p class="dockerfile-editor-note" data-accepted-dockerfile-reasoning="${row.id}">${esc(dockerTest.dockerfile.reasoningSummary)}</p>`
           : `<p class="dockerfile-editor-note" data-accepted-dockerfile-reasoning="${row.id}" hidden></p>`;
+        const setupButtonLabel = Array.isArray(row.issues) && row.issues.length === 1 ? "Setup Issue" : "Setup Repo";
 
         return `
           <div class="card accepted-card">
@@ -880,6 +1467,7 @@
                 </div>
               </div>
               <div class="accepted-card-actions">
+                <button type="button" class="btn btn-sm" data-setup-accepted="${row.id}">${setupButtonLabel}</button>
                 <button type="button" class="btn btn-sm btn-info" data-deep-scan-accepted="${esc(row.repo_full_name)}">Deep Scan Repo</button>
                 <button type="button" class="btn btn-sm" data-toggle-accepted-details="${row.id}" aria-expanded="${expanded ? "true" : "false"}">${expanded ? "Hide Details" : "View Details"}</button>
               </div>
@@ -1053,6 +1641,15 @@
       $$("[data-deep-scan-accepted]", container).forEach((button) => {
         button.addEventListener("click", () => {
           prepareSingleRepoDeepScan(button.dataset.deepScanAccepted);
+        });
+      });
+
+      $$("[data-setup-accepted]", container).forEach((button) => {
+        button.addEventListener("click", () => {
+          const candidateId = Number(button.dataset.setupAccepted);
+          const row = rows.find((item) => Number(item.id) === candidateId);
+          if (!row) return;
+          prepareAcceptedSetup(row);
         });
       });
 
@@ -1346,7 +1943,7 @@
       const tbody = $("#issues-tbody");
 
       if (data.rows.length === 0) {
-        tbody.innerHTML = `<tr><td colspan="5"><div class="empty-state"><div class="empty-icon">🐛</div><p>No issues yet. Run a scan to discover verified issues.</p></div></td></tr>`;
+        tbody.innerHTML = `<tr><td colspan="6"><div class="empty-state"><div class="empty-icon">🐛</div><p>No issues yet. Run a scan to discover verified issues.</p></div></td></tr>`;
         $("#issues-pagination").innerHTML = "";
         return;
       }
@@ -1358,12 +1955,21 @@
           <td>#${i.pr_number} — ${esc(i.pr_title || "")}</td>
           <td><span class="badge ${i.state === 'open' ? 'badge-open' : 'badge-closed'}">${i.state || "—"}</span></td>
           <td>${esc(i.link_type)}</td>
+          <td><button type="button" class="btn btn-sm" data-setup-issue="${i.id}">Setup</button></td>
         </tr>
       `).join("");
 
+      $$("[data-setup-issue]", tbody).forEach((button) => {
+        button.addEventListener("click", () => {
+          const issue = data.rows.find((row) => Number(row.id) === Number(button.dataset.setupIssue));
+          if (!issue) return;
+          prepareIssueSetup(issue);
+        });
+      });
+
       renderPagination($("#issues-pagination"), data.total, ISSUES_PER_PAGE, issuesPage, (p) => { issuesPage = p; loadIssues(); });
     } catch (err) {
-      $("#issues-tbody").innerHTML = `<tr><td colspan="5"><div class="empty-state"><p>Error: ${err.message}</p></div></td></tr>`;
+      $("#issues-tbody").innerHTML = `<tr><td colspan="6"><div class="empty-state"><p>Error: ${err.message}</p></div></td></tr>`;
     }
   }
 
@@ -1884,7 +2490,7 @@
       repoLimit: Number($("#f-repo-limit").value) || 10,
       repoConcurrency: Math.max(1, Number($("#f-repo-concurrency").value) || 1),
       prLimit: Number($("#f-pr-limit").value) || 10,
-      minStars: Number($("#f-min-stars").value) || 50,
+      minStars: Number($("#f-min-stars").value) || 200,
       mergedAfter: $("#f-merged-after").value || undefined,
       scanMode: $("#f-scan-mode").value || "issue-first",
       targetRepo: $("#f-target-repo").value.trim() || undefined,
@@ -1931,6 +2537,18 @@
     $("#scan-status-text").textContent = data.currentStage || (data.running ? "Starting scan..." : "No recent scan activity.");
     setScanBadge(data.status, Boolean(data.running));
 
+    const liveSummaryBox = $("#scan-live-summary");
+    const summary = data.summary && typeof data.summary === "object" ? data.summary : null;
+    const hasSummary = Boolean(summary) && (
+      data.running
+      || Number(summary.totalReposDiscovered) > 0
+      || Number(summary.totalReposProcessed) > 0
+      || Number(summary.totalPullRequestsAnalyzed) > 0
+      || Number(summary.totalCandidatesRecorded) > 0
+    );
+    liveSummaryBox.style.display = hasSummary ? "block" : "none";
+    liveSummaryBox.innerHTML = hasSummary ? renderLiveScanSummary(summary) : "";
+
     const metricsBox = $("#scan-performance-summary");
     const hasMetrics = data.metrics && Array.isArray(data.metrics.steps) && data.metrics.steps.length > 0;
     metricsBox.style.display = hasMetrics ? "block" : "none";
@@ -1947,6 +2565,10 @@
       const data = await api("/api/scans/active/logs");
       if (data.running || (Array.isArray(data.logs) && data.logs.length) || (data.metrics && data.metrics.steps?.length)) {
         renderScanState(data);
+      }
+
+      if (data.running && document.querySelector("#page-repos.page.active")) {
+        void loadRepos($("#repo-search").value);
       }
 
       if (!data.running) {
@@ -2035,6 +2657,32 @@
     `;
   }
 
+  function renderLiveScanSummary(summary) {
+    const statCard = (label, value) => `
+      <div class="scan-performance-stat">
+        <span class="scan-performance-label">${label}</span>
+        <span class="scan-performance-value">${value}</span>
+      </div>
+    `;
+    const scanned = typeof summary?.currentRepoPullRequestsScanned === "number" ? summary.currentRepoPullRequestsScanned : null;
+    const total = typeof summary?.currentRepoPullRequestsTotal === "number" ? summary.currentRepoPullRequestsTotal : null;
+    const passed = typeof summary?.currentRepoBasicFilterPasses === "number" ? summary.currentRepoBasicFilterPasses : null;
+    const limit = typeof summary?.currentRepoPrLimit === "number" ? summary.currentRepoPrLimit : null;
+
+    return `
+      <div class="scan-performance-grid">
+        ${statCard("Repos Found", summary?.totalReposDiscovered ?? 0)}
+        ${statCard("Repos Processed", summary?.totalReposProcessed ?? 0)}
+        ${statCard("PRs Scanned", summary?.totalPullRequestsAnalyzed ?? 0)}
+        ${statCard("Candidates", summary?.totalCandidatesRecorded ?? 0)}
+        ${statCard("Accepted", summary?.acceptedCount ?? 0)}
+        ${statCard("Rejected", summary?.rejectedCount ?? 0)}
+      </div>
+      ${summary?.currentRepoFullName ? `<p class="scan-live-meta"><strong>Current repo:</strong> ${esc(summary.currentRepoFullName)}</p>` : ""}
+      ${scanned !== null || total !== null || passed !== null ? `<p class="scan-live-meta"><strong>Repo progress:</strong> ${total !== null ? `${scanned ?? 0}/${total} PRs walked` : `${scanned ?? 0} PRs walked`}, ${passed ?? 0} passed basic filter${limit !== null ? `, limit ${limit}` : ""}</p>` : ""}
+    `;
+  }
+
   /* ---- Utility ---- */
   function esc(s) {
     if (!s) return "";
@@ -2054,6 +2702,7 @@
     switch (page) {
       case "dashboard": loadDashboard(); break;
       case "repos": loadRepos(); break;
+      case "setup": loadSetup(); break;
       case "accepted": loadAccepted(); break;
       case "issues": loadIssues(); break;
       case "scans": loadScans(); break;

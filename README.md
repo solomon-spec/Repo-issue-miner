@@ -81,6 +81,8 @@ src/
   parsing.ts        issue parsing and PR non-triviality scoring
   pipeline.ts       end-to-end scan pipeline
   repo-screen.ts    repo validity checks
+  setup.ts          setup prompt and path helpers
+  setup-runner.ts   Codex setup execution
   types.ts          shared types
   util.ts           helpers
 ```
@@ -125,6 +127,8 @@ Important env vars:
 - `TARGET_REPO`: optional default `owner/name` deep-scan target
 - `REPO_CONCURRENCY`: how many repos to process in parallel during a normal scan
 - `DB_PATH`, `OUTPUT_ROOT`, `WORK_ROOT`: storage and temp-work locations
+- `SETUP_CLONE_ROOT`: default root for Codex setup snapshots, default `~/Documents/pr-writer-tasks`
+- `CODEX_CLI_PATH`: optional absolute path to the Codex CLI if the dashboard process cannot find `codex` on `PATH`
 
 ## Run The Web App
 
@@ -143,11 +147,41 @@ http://localhost:3000
 ```
 
 Useful commands:
+- `npm run build`: compile TypeScript to `dist/`
+- `npm run clean-db`: clear the configured SQLite database and reset IDs
 - `npm run serve`: start the web app
 - `npm run serve:lan`: start the web app on your local network
 - `npm run dev`: rebuild, then start the web app
 - `npm run dev:lan`: rebuild, then start the web app on your local network
 - `npm run scan`: run a CLI scan directly
+
+## Codex Setup
+
+The dashboard now has a `Setup` page that can run Codex against either:
+- a repository
+- a specific verified issue
+
+The seeded profiles are now:
+- `Python Initial Setup`
+- `JavaScript Initial Setup`
+- `TypeScript Initial Setup`
+
+Each setup profile controls:
+- the starting prompt
+- which files Codex should read first
+- which files Codex is allowed to change
+- a validation prompt instead of hardcoded validation commands
+- the clone root used for local setup snapshots
+
+Issue-target setup runs now use the linked fix PR base/pre-fix commit so Codex prepares the repository before the historical fix is applied.
+
+Successful setup runs also configure local git author settings in the isolated snapshot and create:
+
+```bash
+git commit --author="PR Writer <prwriter@reveloexperts.com>" -m "Set up initial instructions"
+```
+
+If setup runs fail with a Codex executable error, set `CODEX_CLI_PATH` in `.env` to the full path of your local `codex` binary.
 
 To expose the app on your LAN, either set `HOST=0.0.0.0` in `.env` or use the LAN scripts above. The startup log will print the detected local-network URLs you can open from another device on the same network.
 
@@ -160,17 +194,23 @@ node dist/index.js scan \
   --repo-limit 10 \
   --repo-concurrency 2 \
   --pr-limit 15 \
-  --min-stars 100 \
+  --min-stars 200 \
   --merged-after 2024-01-01 \
   --scan-mode issue-first \
   --target-repo owner/name \
   --output-root ./output
 ```
 
-Dry-run mode skips Docker build validation but still mines and scores candidates:
+Dry-run mode is now the default. It skips Docker plan discovery and build validation, so repos without a Dockerfile can still be mined and scored:
 
 ```bash
-node dist/index.js scan --dry-run
+node dist/index.js scan
+```
+
+To require Docker validation for a scan, disable dry-run explicitly:
+
+```bash
+node dist/index.js scan --dry-run false
 ```
 
 ## Output
@@ -195,7 +235,7 @@ Rejected entries include the same context plus rejection reasons.
 - GitHub GraphQL search is used for repo and PR discovery, so a GitHub token is strongly recommended.
 - The issue-link check is intentionally strict and now prefers GitHub-native linked issues only.
 - The repo-size check is done on the checked-out pre-fix snapshot, not just on GitHub metadata.
-- Docker build success is required for final acceptance unless you run `--dry-run`.
+- Docker build success is required for final acceptance only when dry-run is disabled.
 - The app checks that tests exist in the repo, but it does not run those tests for you in-app.
 - Compose service selection is basic in this version. Gemini can help, but the validator still enforces a narrow safe command set.
 - This version assumes the repo's Dockerfile is sufficient for pre-fix execution. Multi-service repos with databases or extra infrastructure may still be rejected.

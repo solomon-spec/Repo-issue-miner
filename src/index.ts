@@ -1,5 +1,6 @@
 import { networkInterfaces } from "node:os";
 import { loadConfig } from "./config.js";
+import { getDb, resetDatabase } from "./db.js";
 import { runScan } from "./pipeline.js";
 import { createApp } from "./server.js";
 
@@ -12,26 +13,29 @@ Usage:
 Commands:
   serve           Start the web dashboard (default)
   scan            Run a scan from the CLI
+  clean-db        Remove all persisted scan data from the configured SQLite DB
 
 Scan Options:
   --languages python,javascript,typescript
   --repo-limit 10
   --repo-concurrency 2
   --pr-limit 10
-  --min-stars 50
+  --min-stars 200
   --merged-after 2024-01-01
   --scan-mode issue-first|pr-first
   --target-repo owner/name
   --work-root /tmp/repo-issue-miner
   --output-root ./output
   --db-path ./data/repo-miner.db
-  --dry-run
+  --dry-run [true|false]
   --keep-worktree
 
 Server Options:
   --host 127.0.0.1
   --port 3000
   --db-path ./data/repo-miner.db
+  --setup-clone-root ~/Documents/pr-writer-tasks
+  --codex-cli-path /absolute/path/to/codex
 `);
 }
 
@@ -62,7 +66,9 @@ async function main(): Promise<void> {
     return;
   }
 
-  const command = firstArg === "scan" || firstArg === "serve" ? firstArg : undefined;
+  const command = firstArg === "scan" || firstArg === "serve" || firstArg === "clean-db" || firstArg === "reset-db"
+    ? firstArg
+    : undefined;
   const args = command ? rawArgs.slice(1) : rawArgs;
   const config = loadConfig(args);
 
@@ -86,6 +92,13 @@ async function main(): Promise<void> {
         timings: item.timings,
       })),
     }, null, 2));
+    return;
+  }
+
+  if (command === "clean-db" || command === "reset-db") {
+    const db = getDb(config.dbPath);
+    resetDatabase(db);
+    console.log(`Cleared database at ${config.dbPath}`);
     return;
   }
 

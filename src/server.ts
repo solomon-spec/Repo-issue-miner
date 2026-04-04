@@ -3,15 +3,54 @@ import { createHash } from "node:crypto";
 import { writeFileSync } from "node:fs";
 import { dirname, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
-import { Config, ExecutionResult, ScanConfigOverrides, ScanPerformanceMetrics, ScanStatus, SearchRepo, TestPlan, Language } from "./types.js";
+import {
+  Config,
+  ExecutionResult,
+  Language,
+  ScanConfigOverrides,
+  ScanLiveProgress,
+  ScanPerformanceMetrics,
+  ScanStatus,
+  SearchRepo,
+  TestPlan,
+} from "./types.js";
 import { runScan } from "./pipeline.js";
 import { cleanupSnapshot, prepareSnapshot } from "./git.js";
 import { executeTestPlan, executeTestPlanWithTests } from "./docker.js";
 import { fixDockerfileForTestFailure, generateDockerfileForTests, resolveTestPlan } from "./gemini.js";
 import { GitHubClient } from "./github.js";
-import { getDb, getStats, getRepos, getRepoById, deleteRepo, getScans, getScanById, getIssues, getTestsUnableCandidates, getAcceptedCandidates, getIssuesForCandidate, getIssuesForCandidateIds, getScanCandidateById, refreshScanCounts, updateScanCandidateState } from "./db.js";
+import {
+  createSetupProfile,
+  createSetupRun,
+  deleteRepo,
+  deleteSetupProfile,
+  getAcceptedCandidates,
+  getDb,
+  getIssueRecordById,
+  getIssues,
+  getIssuesForCandidate,
+  getIssuesForCandidateIds,
+  getRepoById,
+  getRepoRecordById,
+  getRepos,
+  getScanById,
+  getScanCandidateById,
+  getScans,
+  getSetupProfileById,
+  getSetupProfiles,
+  getSetupRunById,
+  getSetupRuns,
+  getStats,
+  getTestsUnableCandidates,
+  refreshScanCounts,
+  updateScanCandidateState,
+  updateSetupProfile,
+} from "./db.js";
+import { parseSetupPathList } from "./setup.js";
+import { pickPreferredSetupProfile } from "./setup-profiles.js";
+import { ActiveSetupRunState, appendSetupRunLog, runSetupTask, setupRunStateToApi, type SetupTaskTarget } from "./setup-runner.js";
 import { cleanupProjectStorage } from "./storage.js";
-import { CommandAbortedError, ensureDir, readUtf8Safe, unique } from "./util.js";
+import { CommandAbortedError, ensureDir, readUtf8Safe, runCommand, unique } from "./util.js";
 
 const __dirname = fileURLToPath(new URL(".", import.meta.url));
 
@@ -20,6 +59,7 @@ type ActiveScanState = {
   logs: string[];
   status: ScanStatus;
   currentStage: string;
+  summary: ScanLiveProgress;
   startedAt: string;
   finishedAt?: string;
   scanId?: number;
@@ -45,6 +85,7 @@ type ActiveAcceptedTestRunState = ActiveTestRerunState;
 let activeScan: ActiveScanState | undefined;
 const activeTestRerunStates = new Map<number, ActiveTestRerunState>();
 const activeAcceptedTestRunStates = new Map<number, ActiveAcceptedTestRunState>();
+const activeSetupRunStates = new Map<number, ActiveSetupRunState>();
 const EXECUTION_REASON_PREFIXES = [
   "failed to prepare snapshot",
   "snapshot exceeds max size:",
@@ -67,6 +108,17 @@ function appendScanLog(scan: ActiveScanState, msg: string): void {
       scan.scanId = Number(match[1]);
     }
   }
+}
+
+function emptyScanSummary(): ScanLiveProgress {
+  return {
+    totalReposDiscovered: 0,
+    totalReposProcessed: 0,
+    totalPullRequestsAnalyzed: 0,
+    totalCandidatesRecorded: 0,
+    acceptedCount: 0,
+    rejectedCount: 0,
+  };
 }
 
 function appendTestRerunLog(rerun: ActiveTestRerunState, msg: string): void {
@@ -407,6 +459,102 @@ function toSearchRepo(row: any): SearchRepo {
   };
 }
 
+function repoRecordToSearchRepo(row: any): SearchRepo {
+  return {
+    owner: String(row.owner),
+    name: String(row.name),
+    fullName: String(row.full_name),
+    url: String(row.url),
+    isArchived: Boolean(row.is_archived),
+    stars: Number(row.stars ?? 0),
+    primaryLanguage: typeof row.primary_language === "string" ? row.primary_language : undefined,
+    defaultBranch: typeof row.default_branch === "string" ? row.default_branch : "main",
+    pushedAt: typeof row.pushed_at === "string" ? row.pushed_at : undefined,
+    diskUsageKb: typeof row.disk_usage_kb === "number" ? row.disk_usage_kb : undefined,
+    description: typeof row.description === "string" ? row.description : row.description ?? undefined,
+  };
+}
+
+function repoRowToSetupTarget(row: any): SetupTaskTarget {
+  const repo = repoRecordToSearchRepo(row);
+  return {
+    targetType: "repo",
+    targetLabel: repo.fullName,
+    repoId: Number(row.id),
+    repo,
+  };
+}
+
+function issueRowToSetupTarget(row: any): SetupTaskTarget {
+  return {
+    targetType: "issue",
+    targetLabel: `${String(row.repo_full_name)} issue #${String(row.number)}${row.title ? `: ${String(row.title)}` : ""}`,
+    repoId: Number(row.repo_id),
+    repo: {
+      owner: String(row.repo_owner),
+      name: String(row.repo_name),
+      fullName: String(row.repo_full_name),
+      url: String(row.repo_url),
+      isArchived: Boolean(row.repo_is_archived),
+      stars: Number(row.repo_stars ?? 0),
+      primaryLanguage: typeof row.repo_primary_language === "string" ? row.repo_primary_language : undefined,
+      defaultBranch: typeof row.repo_default_branch === "string" ? row.repo_default_branch : "main",
+      pushedAt: typeof row.repo_pushed_at === "string" ? row.repo_pushed_at : undefined,
+      diskUsageKb: typeof row.repo_disk_usage_kb === "number" ? row.repo_disk_usage_kb : undefined,
+      description: typeof row.repo_description === "string" ? row.repo_description : row.repo_description ?? undefined,
+    },
+    checkoutSha: typeof row.pr_base_ref_oid === "string" ? row.pr_base_ref_oid : undefined,
+    issueId: Number(row.id),
+    issueNumber: Number(row.number),
+    issueTitle: typeof row.title === "string" ? row.title : undefined,
+    issueBody: typeof row.body === "string" ? row.body : undefined,
+    issueUrl: typeof row.url === "string" ? row.url : undefined,
+    pullRequestNumber: typeof row.pr_number === "number" ? row.pr_number : undefined,
+    pullRequestTitle: typeof row.pr_title === "string" ? row.pr_title : undefined,
+    pullRequestUrl: typeof row.pr_url === "string" ? row.pr_url : undefined,
+  };
+}
+
+function parseSetupProfilePayload(body: any, defaultCloneRoot: string): {
+  name: string;
+  prompt: string;
+  contextPaths: string[];
+  writablePaths: string[];
+  validationPrompt: string;
+  cloneRootPath: string;
+  model?: string;
+  sandboxMode: "workspace-write" | "danger-full-access";
+} {
+  const name = asNonEmptyString(body?.name);
+  const prompt = asNonEmptyString(body?.prompt);
+  if (!name) {
+    throw new RequestValidationError("profile name is required");
+  }
+  if (!prompt) {
+    throw new RequestValidationError("profile prompt is required");
+  }
+
+  const contextPaths = parseSetupPathList(body?.contextPaths);
+  const writablePaths = parseSetupPathList(body?.writablePaths);
+  const validationPrompt = typeof body?.validationPrompt === "string" ? body.validationPrompt.trim() : "";
+  const cloneRootPath = asNonEmptyString(body?.cloneRootPath) ?? defaultCloneRoot;
+
+  return {
+    name,
+    prompt,
+    contextPaths,
+    writablePaths,
+    validationPrompt,
+    cloneRootPath,
+    model: asNonEmptyString(body?.model),
+    sandboxMode: body?.sandboxMode === "danger-full-access" ? "danger-full-access" : "workspace-write",
+  };
+}
+
+function isUniqueSetupProfileNameError(error: unknown): boolean {
+  return error instanceof Error && /UNIQUE constraint failed: setup_profiles\.name/.test(error.message);
+}
+
 async function measureAsyncStep<T>(step: string, fn: () => Promise<T>): Promise<{ result: T; timing: { step: string; durationMs: number } }> {
   const started = performance.now();
   const result = await fn();
@@ -448,6 +596,93 @@ export function createApp(config: Config): express.Express {
         activeAcceptedTestRunStates.delete(candidateId);
       }
     }, 15 * 60 * 1000);
+  };
+
+  const scheduleActiveSetupRunCleanup = (runId: number): void => {
+    setTimeout(() => {
+      const run = activeSetupRunStates.get(runId);
+      if (run && run.status !== "running") {
+        activeSetupRunStates.delete(runId);
+      }
+    }, 30 * 60 * 1000);
+  };
+
+  const queueSetupTask = (target: SetupTaskTarget, profile: NonNullable<ReturnType<typeof getSetupProfileById>>, runState: ActiveSetupRunState): void => {
+    void runSetupTask({ config, db, github }, target, profile, runState)
+      .finally(() => {
+        scheduleActiveSetupRunCleanup(runState.runId);
+      });
+  };
+
+  const startSetupTarget = (target: SetupTaskTarget, profileId: number | undefined): Record<string, unknown> => {
+    const existing = [...activeSetupRunStates.values()].find((run) => {
+      if (run.status !== "running") return false;
+      if (target.targetType === "issue") {
+        return run.targetType === "issue" && run.issueId === target.issueId;
+      }
+      return run.targetType === "repo" && run.repoId === target.repoId;
+    });
+    if (existing) {
+      throw new RequestValidationError(
+        target.targetType === "issue"
+          ? "this issue already has a setup task running"
+          : "this repo already has a setup task running",
+      );
+    }
+
+    const profile = typeof profileId === "number"
+      ? getSetupProfileById(db, profileId)
+      : pickPreferredSetupProfile(getSetupProfiles(db), target.repo.primaryLanguage);
+    if (!profile) {
+      throw new RequestValidationError("no setup profile is available; create one first");
+    }
+
+    const runId = createSetupRun(db, {
+      targetType: target.targetType,
+      targetLabel: target.targetLabel,
+      repoId: target.repoId,
+      issueId: target.issueId,
+      issueNumber: target.issueNumber,
+      issueTitle: target.issueTitle,
+      profileId: profile.id,
+      prompt: profile.prompt,
+      contextPaths: profile.contextPaths,
+      writablePaths: profile.writablePaths,
+      validationPrompt: profile.validationPrompt,
+      cloneRootPath: profile.cloneRootPath,
+      model: profile.model,
+      sandboxMode: profile.sandboxMode,
+    });
+
+    const runRecord = getSetupRunById(db, runId);
+    if (!runRecord) {
+      throw new Error("failed to create setup task");
+    }
+
+    const runState: ActiveSetupRunState = {
+      runId,
+      targetType: target.targetType,
+      targetLabel: target.targetLabel,
+      repoId: target.repoId,
+      repoFullName: target.repo.fullName,
+      issueId: target.issueId,
+      profileId: profile.id,
+      profileName: profile.name,
+      status: "running",
+      stage: "Queued setup task",
+      startedAt: runRecord.startedAt,
+      logs: [],
+      liveOutput: "",
+      stopRequested: false,
+      abortController: new AbortController(),
+      changedFiles: [],
+      violationFiles: [],
+    };
+    activeSetupRunStates.set(runId, runState);
+    appendSetupRunLog(runState, `Queued setup task using profile ${profile.name}`);
+    queueSetupTask(target, profile, runState);
+
+    return setupRunStateToApi(runRecord, runState);
   };
 
   const runAcceptedTestRun = async (
@@ -837,6 +1072,172 @@ export function createApp(config: Config): express.Express {
     const ok = deleteRepo(db, Number(req.params.id));
     if (!ok) return res.status(404).json({ error: "repo not found" });
     res.json({ deleted: true });
+  });
+
+  app.post("/api/repos/:id/setup", (req, res) => {
+    const repoId = Number(req.params.id);
+    if (!Number.isFinite(repoId)) {
+      return res.status(400).json({ error: "invalid repo id" });
+    }
+
+    const repoRow = getRepoRecordById(db, repoId);
+    if (!repoRow) {
+      return res.status(404).json({ error: "repo not found" });
+    }
+
+    const requestBody = asRecord(req.body) ?? {};
+    const requestedProfileId = Number(requestBody.profileId);
+    try {
+      return res.status(202).json(startSetupTarget(repoRowToSetupTarget(repoRow), Number.isFinite(requestedProfileId) ? requestedProfileId : undefined));
+    } catch (err) {
+      const status = err instanceof RequestValidationError ? 400 : 500;
+      return res.status(status).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.post("/api/issues/:id/setup", (req, res) => {
+    const issueId = Number(req.params.id);
+    if (!Number.isFinite(issueId)) {
+      return res.status(400).json({ error: "invalid issue id" });
+    }
+
+    const issueRow = getIssueRecordById(db, issueId);
+    if (!issueRow) {
+      return res.status(404).json({ error: "issue not found" });
+    }
+
+    const requestBody = asRecord(req.body) ?? {};
+    const requestedProfileId = Number(requestBody.profileId);
+    try {
+      return res.status(202).json(startSetupTarget(issueRowToSetupTarget(issueRow), Number.isFinite(requestedProfileId) ? requestedProfileId : undefined));
+    } catch (err) {
+      const status = err instanceof RequestValidationError ? 400 : 500;
+      return res.status(status).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  /* ---------------------------------------------------------------- */
+  /* Setup                                                             */
+  /* ---------------------------------------------------------------- */
+  app.get("/api/setup/profiles", (_req, res) => {
+    res.json(getSetupProfiles(db));
+  });
+
+  app.post("/api/setup/profiles", (req, res) => {
+    try {
+      const input = parseSetupProfilePayload(req.body, config.setupDefaultCloneRoot);
+      const id = createSetupProfile(db, input);
+      const profile = getSetupProfileById(db, id);
+      return res.status(201).json(profile);
+    } catch (err) {
+      if (err instanceof RequestValidationError) {
+        return res.status(400).json({ error: err.message });
+      }
+      if (isUniqueSetupProfileNameError(err)) {
+        return res.status(409).json({ error: "a setup profile with that name already exists" });
+      }
+      return res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.put("/api/setup/profiles/:id", (req, res) => {
+    const profileId = Number(req.params.id);
+    if (!Number.isFinite(profileId)) {
+      return res.status(400).json({ error: "invalid profile id" });
+    }
+    if (!getSetupProfileById(db, profileId)) {
+      return res.status(404).json({ error: "setup profile not found" });
+    }
+
+    try {
+      const input = parseSetupProfilePayload(req.body, config.setupDefaultCloneRoot);
+      updateSetupProfile(db, profileId, input);
+      return res.json(getSetupProfileById(db, profileId));
+    } catch (err) {
+      if (err instanceof RequestValidationError) {
+        return res.status(400).json({ error: err.message });
+      }
+      if (isUniqueSetupProfileNameError(err)) {
+        return res.status(409).json({ error: "a setup profile with that name already exists" });
+      }
+      return res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.delete("/api/setup/profiles/:id", (req, res) => {
+    const profileId = Number(req.params.id);
+    if (!Number.isFinite(profileId)) {
+      return res.status(400).json({ error: "invalid profile id" });
+    }
+    const ok = deleteSetupProfile(db, profileId);
+    if (!ok) {
+      return res.status(404).json({ error: "setup profile not found" });
+    }
+    return res.json({ deleted: true });
+  });
+
+  app.get("/api/setup/runs", (req, res) => {
+    const repoId = typeof req.query.repoId === "string" && req.query.repoId.trim()
+      ? Number(req.query.repoId)
+      : undefined;
+    const issueId = typeof req.query.issueId === "string" && req.query.issueId.trim()
+      ? Number(req.query.issueId)
+      : undefined;
+    if (req.query.repoId !== undefined && !Number.isFinite(repoId)) {
+      return res.status(400).json({ error: "invalid repo id" });
+    }
+    if (req.query.issueId !== undefined && !Number.isFinite(issueId)) {
+      return res.status(400).json({ error: "invalid issue id" });
+    }
+    const limit = Math.min(Number(req.query.limit) || 20, 100);
+    const offset = Number(req.query.offset) || 0;
+    const data = getSetupRuns(db, { repoId, issueId, limit, offset });
+    return res.json({
+      total: data.total,
+      rows: data.rows.map((row) => setupRunStateToApi(row, activeSetupRunStates.get(row.id))),
+    });
+  });
+
+  app.get("/api/setup/runs/:id", (req, res) => {
+    const runId = Number(req.params.id);
+    if (!Number.isFinite(runId)) {
+      return res.status(400).json({ error: "invalid setup run id" });
+    }
+    const run = getSetupRunById(db, runId);
+    if (!run) {
+      return res.status(404).json({ error: "setup run not found" });
+    }
+    const active = activeSetupRunStates.get(runId);
+    const stdoutPath = active?.stdoutPath ?? run.stdoutPath;
+    const stderrPath = active?.stderrPath ?? run.stderrPath;
+    const lastMessagePath = active?.lastMessagePath ?? run.lastMessagePath;
+    const diffPath = active?.diffPath ?? run.diffPath;
+    return res.json({
+      ...setupRunStateToApi(run, active),
+      stdoutExcerpt: readLogExcerpt(stdoutPath, 12_000) ?? "",
+      stderrExcerpt: readLogExcerpt(stderrPath, 12_000) ?? "",
+      lastMessage: readUtf8Safe(lastMessagePath ?? "") ?? "",
+      diffExcerpt: readLogExcerpt(diffPath, 20_000) ?? "",
+    });
+  });
+
+  app.post("/api/setup/runs/:id/stop", (req, res) => {
+    const runId = Number(req.params.id);
+    if (!Number.isFinite(runId)) {
+      return res.status(400).json({ error: "invalid setup run id" });
+    }
+    const active = activeSetupRunStates.get(runId);
+    if (!active || active.status !== "running") {
+      return res.status(409).json({ error: "this setup task is not currently running" });
+    }
+    const run = getSetupRunById(db, runId);
+    if (!run) {
+      return res.status(404).json({ error: "setup run not found" });
+    }
+    active.stopRequested = true;
+    appendSetupRunLog(active, "Stop requested by user");
+    active.abortController.abort();
+    return res.json(setupRunStateToApi(run, active));
   });
 
   /* ---------------------------------------------------------------- */
@@ -1481,13 +1882,14 @@ export function createApp(config: Config): express.Express {
 
   app.get("/api/scans/active/logs", (_req, res) => {
     if (!activeScan) {
-      return res.json({ running: false, status: "completed", logs: [], currentStage: "", metrics: null });
+      return res.json({ running: false, status: "completed", logs: [], currentStage: "", summary: null, metrics: null });
     }
     res.json({
       running: activeScan.status === "running",
       status: activeScan.status,
       logs: activeScan.logs,
       currentStage: activeScan.currentStage,
+      summary: activeScan.summary,
       startedAt: activeScan.startedAt,
       finishedAt: activeScan.finishedAt ?? null,
       scanId: activeScan.scanId ?? null,
@@ -1526,18 +1928,30 @@ export function createApp(config: Config): express.Express {
       logs: [],
       status: "running",
       currentStage: "Starting scan...",
+      summary: emptyScanSummary(),
       startedAt: new Date().toISOString(),
     };
     appendScanLog(scanState, "Starting scan...");
 
     const promise = runScan(scanConfig, (msg) => {
       appendScanLog(scanState, msg);
+    }, (summary) => {
+      scanState.summary = summary;
     })
       .then((report) => {
         scanState.status = "completed";
         scanState.finishedAt = new Date().toISOString();
         scanState.scanId = report.scanId;
         scanState.metrics = report.performanceMetrics;
+        scanState.summary = {
+          ...scanState.summary,
+          totalReposDiscovered: report.performanceMetrics.totalReposDiscovered,
+          totalReposProcessed: report.performanceMetrics.totalReposProcessed,
+          totalPullRequestsAnalyzed: report.performanceMetrics.totalPullRequestsAnalyzed,
+          totalCandidatesRecorded: report.performanceMetrics.totalCandidatesRecorded,
+          acceptedCount: report.accepted.length,
+          rejectedCount: report.rejected.length,
+        };
         appendScanLog(scanState, "Scan finished successfully");
       })
       .catch((err) => {
