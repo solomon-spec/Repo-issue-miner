@@ -5,11 +5,13 @@ import { resolveTestPlan } from "./gemini.js";
 import { executeTestPlan } from "./docker.js";
 import { analyzePullRequestFiles, chooseLanguageBucket } from "./parsing.js";
 import { screenRepository } from "./repo-screen.js";
+import { cleanupProjectStorage } from "./storage.js";
 import {
   CandidateReport,
   Config,
   IssueRef,
   Language,
+  ScanLiveProgress,
   ScanPerformanceMetrics,
   ScanReport,
   SearchRepo,
@@ -27,6 +29,7 @@ import {
 } from "./db.js";
 
 export type ProgressCallback = (msg: string) => void;
+export type ProgressStateCallback = (state: ScanLiveProgress) => void;
 const SCAN_DOCKER_TIMEOUT_MS = 15 * 60 * 1000;
 
 /* ------------------------------------------------------------------ */
@@ -197,6 +200,26 @@ async function verifyIssueLinks(
   });
 }
 
+function issueKey(issue: IssueRef): string {
+  return `${issue.owner}/${issue.repo}#${issue.number}`;
+}
+
+function buildIssueToPullRequestMap(prs: Array<{ number: number; linkedIssues?: IssueRef[] }>): Map<string, Set<number>> {
+  const issueToPrNumbers = new Map<string, Set<number>>();
+  for (const pr of prs) {
+    for (const issue of pr.linkedIssues ?? []) {
+      if ((issue.state ?? "").toLowerCase() !== "closed") {
+        continue;
+      }
+      const key = issueKey(issue);
+      const current = issueToPrNumbers.get(key) ?? new Set<number>();
+      current.add(pr.number);
+      issueToPrNumbers.set(key, current);
+    }
+  }
+  return issueToPrNumbers;
+}
+
 /* ------------------------------------------------------------------ */
 /* Rejected candidate helper                                           */
 /* ------------------------------------------------------------------ */
@@ -233,12 +256,14 @@ function makeRejectedCandidate(repo: SearchRepo, message: string): CandidateRepo
       relevantTestFiles: [],
       touchedDirectories: [],
       ignoredFiles: [],
+      codeLinesChanged: 0,
       nonTrivialScore: 0,
       nonTrivialReasons: [message],
       accepted: false,
     },
     preFixSha: "",
     accepted: false,
+    basicFilterPassed: false,
     rejectionReasons: [message],
     timings: [],
     testsUnableToRun: false,
@@ -281,9 +306,15 @@ function summarizeDockerFailure(candidate: CandidateReport): { fingerprint: stri
 export async function runScan(
   config: Config,
   onProgress?: ProgressCallback,
+  onProgressState?: ProgressStateCallback,
 ): Promise<ScanReport> {
   ensureDir(config.outputRoot);
   ensureDir(config.workRoot);
+  const cleanupSummary = cleanupProjectStorage(config);
+  if (!cleanupSummary.skipped && cleanupSummary.removedItems.length > 0) {
+    const freedMb = (cleanupSummary.removedBytes / (1024 * 1024)).toFixed(1);
+    onProgress?.(`Storage cleanup removed ${cleanupSummary.removedItems.length} stale item(s), freeing about ${freedMb} MiB`);
+  }
   const db = getDb(config.dbPath);
   const github = new GitHubClient(config);
   const accepted: CandidateReport[] = [];
@@ -296,16 +327,34 @@ export async function runScan(
   let totalPullRequestsAnalyzed = 0;
   const scheduledRepoFullNames = new Set<string>();
   const normalizedTargetRepo = config.targetRepo?.toLowerCase();
+  const liveProgress: ScanLiveProgress = {
+    totalReposDiscovered: 0,
+    totalReposProcessed: 0,
+    totalPullRequestsAnalyzed: 0,
+    totalCandidatesRecorded: 0,
+    acceptedCount: 0,
+    rejectedCount: 0,
+  };
 
   const progress = (message: string): void => {
     onProgress?.(message);
+  };
+  const emitProgressState = (): void => {
+    onProgressState?.({ ...liveProgress });
+  };
+  const syncRecordedCounts = (): void => {
+    liveProgress.totalCandidatesRecorded = accepted.length + rejected.length;
+    liveProgress.acceptedCount = accepted.length;
+    liveProgress.rejectedCount = rejected.length;
+    emitProgressState();
   };
 
   const safeConfig = { ...config, githubToken: undefined, geminiApiKey: undefined };
   const scanId = createScan(db, JSON.stringify(safeConfig));
   progress(`Scan #${scanId} started`);
+  emitProgressState();
   progress(
-    `Config: languages=${config.languages.join(", ")}, scanMode=${config.targetRepo ? "deep-scan(issue-first exhaustive)" : config.scanMode}, repoLimit=${config.repoLimit}, repoConcurrency=${config.repoConcurrency}, prLimit=${config.targetRepo ? "all linked issues" : config.prLimit}, minStars=${config.minStars}${config.targetRepo ? `, targetRepo=${config.targetRepo}` : ""}${config.mergedAfter ? `, mergedAfter=${config.mergedAfter}` : ""}${config.dryRun ? ", dryRun=true" : ""}`,
+    `Config: languages=${config.languages.join(", ")}, scanMode=${config.targetRepo ? "deep-scan(issue-first exhaustive)" : config.scanMode}, repoLimit=${config.repoLimit}, repoConcurrency=${config.repoConcurrency}, prLimit=${config.targetRepo ? "all linked issues" : config.prLimit}, minStars=${config.minStars}${config.targetRepo ? `, targetRepo=${config.targetRepo}` : ""}${config.targetRepo ? (config.mergedAfter ? ", mergedAfter=ignored for deep scan" : "") : (config.mergedAfter ? `, mergedAfter=${config.mergedAfter}` : "")}${config.dryRun ? ", dryRun=true" : ""}`,
   );
 
   const processRepo = async (
@@ -315,6 +364,13 @@ export async function runScan(
     ordinalLabel?: string,
   ): Promise<void> => {
     totalReposProcessed += 1;
+    liveProgress.totalReposProcessed = totalReposProcessed;
+    liveProgress.currentRepoFullName = repo.fullName;
+    liveProgress.currentRepoPullRequestsScanned = undefined;
+    liveProgress.currentRepoPullRequestsTotal = undefined;
+    liveProgress.currentRepoBasicFilterPasses = undefined;
+    liveProgress.currentRepoPrLimit = undefined;
+    emitProgressState();
     progress(ordinalLabel ? `${logPrefix} ${ordinalLabel}: ${repo.fullName}` : `${logPrefix} ${repo.fullName}`);
 
     const repoId = upsertRepo(db, repo);
@@ -358,6 +414,7 @@ export async function runScan(
           rej.timings = [...timingsForRepo];
           rejected.push(rej);
           insertScanCandidate(db, scanId, repoId, null, rej);
+          syncRecordedCounts();
           return;
         } finally {
           if (fallbackSnapshot) {
@@ -370,6 +427,7 @@ export async function runScan(
         rej.timings = [...timingsForRepo];
         rejected.push(rej);
         insertScanCandidate(db, scanId, repoId, null, rej);
+        syncRecordedCounts();
         return;
       }
     }
@@ -385,6 +443,7 @@ export async function runScan(
       };
       rejected.push(rej);
       insertScanCandidate(db, scanId, repoId, null, rej);
+      syncRecordedCounts();
       return;
     }
     progress(`${repo.fullName} passed screening`);
@@ -396,11 +455,13 @@ export async function runScan(
       rej.timings = [...timingsForRepo];
       rejected.push(rej);
       insertScanCandidate(db, scanId, repoId, null, rej);
+      syncRecordedCounts();
       return;
     }
 
     let prs: Awaited<ReturnType<typeof github.searchMergedPullRequests>>;
     const exhaustiveIssueScan = Boolean(normalizedTargetRepo && repo.fullName.toLowerCase() === normalizedTargetRepo);
+    const rawSearchLimit = exhaustiveIssueScan ? undefined : Math.min(Math.max(config.prLimit * 10, config.prLimit), 1000);
     const searchStep = exhaustiveIssueScan
       ? "issue_search_full"
       : (config.scanMode === "issue-first" ? "issue_search" : "pr_search");
@@ -409,10 +470,10 @@ export async function runScan(
         searchStep,
         timingsForRepo,
         () => exhaustiveIssueScan
-          ? github.searchAllClosedIssuesWithMergedPullRequests(repo, config.mergedAfter)
+          ? github.searchAllClosedIssuesWithMergedPullRequests(repo)
           : (config.scanMode === "issue-first"
-            ? github.searchClosedIssuesWithMergedPullRequests(repo, config.prLimit, config.mergedAfter)
-            : github.searchMergedPullRequests(repo, config.prLimit, config.mergedAfter)),
+            ? github.searchClosedIssuesWithMergedPullRequests(repo, rawSearchLimit as number, config.mergedAfter)
+            : github.searchMergedPullRequests(repo, rawSearchLimit as number, config.mergedAfter)),
         scanTimings,
       );
       prs = r.result;
@@ -434,28 +495,77 @@ export async function runScan(
       rej.timings = [...timingsForRepo];
       rejected.push(rej);
       insertScanCandidate(db, scanId, repoId, null, rej);
+      syncRecordedCounts();
       return;
     }
 
+    const issueToPrNumbers = buildIssueToPullRequestMap(prs);
     let foundAcceptedForRepo = false;
-    let dockerBuildFailuresForRepo = 0;
+    let basicFilterPassesForRepo = 0;
     let stoppedAfterRepeatedDockerFailures = false;
     let repeatedDockerFailureSummary: string | undefined;
     const dockerFailureFingerprintsForRepo = new Map<string, { count: number; summary: string }>();
     const repoRejectReason = "repository rejected after repeated matching Docker build failures across PRs";
+    liveProgress.currentRepoPullRequestsScanned = 0;
+    liveProgress.currentRepoPullRequestsTotal = prs.length;
+    liveProgress.currentRepoBasicFilterPasses = 0;
+    liveProgress.currentRepoPrLimit = exhaustiveIssueScan ? undefined : config.prLimit;
+    emitProgressState();
 
     for (const [prIndex, pr] of prs.entries()) {
       totalPullRequestsAnalyzed += 1;
+      liveProgress.totalPullRequestsAnalyzed = totalPullRequestsAnalyzed;
+      liveProgress.currentRepoFullName = repo.fullName;
+      liveProgress.currentRepoPullRequestsScanned = prIndex + 1;
+      liveProgress.currentRepoPullRequestsTotal = prs.length;
+      liveProgress.currentRepoBasicFilterPasses = basicFilterPassesForRepo;
+      liveProgress.currentRepoPrLimit = exhaustiveIssueScan ? undefined : config.prLimit;
+      emitProgressState();
       const candidateTimings: StepTiming[] = [...timingsForRepo];
       progress(`Analyzing PR ${prIndex + 1}/${prs.length}: ${repo.fullName}#${pr.number}`);
+      const prId = upsertPullRequest(db, repoId, pr);
 
-      const { result: files, timing: prFilesTiming } = await timeStep(
-        "pr_files",
-        candidateTimings,
-        () => github.listPullRequestFiles(repo, pr.number),
-        scanTimings,
-      );
-      progress(`Loaded ${files.length} changed files for ${repo.fullName}#${pr.number} in ${formatDuration(prFilesTiming.durationMs)}`);
+      let files: Awaited<ReturnType<typeof github.listPullRequestFiles>>;
+      try {
+        const fileResult = await timeStep(
+          "pr_files",
+          candidateTimings,
+          () => github.listPullRequestFiles(repo, pr.number),
+          scanTimings,
+        );
+        files = fileResult.result;
+        progress(`Loaded ${files.length} changed files for ${repo.fullName}#${pr.number} in ${formatDuration(fileResult.timing.durationMs)}`);
+      } catch (err) {
+        const reason = "failed to load PR files";
+        const candidate: CandidateReport = {
+          repo,
+          screening,
+          pullRequest: pr,
+          issueRefs: [],
+          analysis: {
+            relevantSourceFiles: [],
+            relevantTestFiles: [],
+            touchedDirectories: [],
+            ignoredFiles: [],
+            codeLinesChanged: 0,
+            nonTrivialScore: 0,
+            nonTrivialReasons: [reason],
+            accepted: false,
+          },
+          preFixSha: pr.baseRefOid,
+          accepted: false,
+          basicFilterPassed: false,
+          rejectionReasons: [reason],
+          timings: candidateTimings,
+          testsUnableToRun: false,
+        };
+        progress(`Rejected ${repo.fullName}#${pr.number}: ${reason} (${err instanceof Error ? err.message : String(err)})`);
+        rejected.push(candidate);
+        insertScanCandidate(db, scanId, repoId, prId, candidate);
+        syncRecordedCounts();
+        continue;
+      }
+
       const analysis = analyzePullRequestFiles(files, bucket);
 
       const { result: issueRefs, timing: issueVerifyTiming } = await timeStep(
@@ -465,8 +575,6 @@ export async function runScan(
         scanTimings,
       );
       progress(`Verified ${issueRefs.length} closed linked issues for ${repo.fullName}#${pr.number} in ${formatDuration(issueVerifyTiming.durationMs)}`);
-
-      const prId = upsertPullRequest(db, repoId, pr);
       for (const issue of issueRefs) {
         upsertIssue(db, prId, issue);
       }
@@ -479,13 +587,23 @@ export async function runScan(
         analysis,
         preFixSha: pr.baseRefOid,
         accepted: false,
+        basicFilterPassed: false,
         rejectionReasons: [],
         timings: candidateTimings,
         testsUnableToRun: false,
       };
 
-      if (issueRefs.length === 0) {
-        candidate.rejectionReasons.push("PR has no verified closed GitHub issue link");
+      if (issueRefs.length !== 1) {
+        candidate.rejectionReasons.push(
+          issueRefs.length === 0
+            ? "PR must be linked to exactly one verified closed GitHub issue"
+            : "PR is linked to more than one verified closed GitHub issue",
+        );
+      } else {
+        const linkedPrCount = issueToPrNumbers.get(issueKey(issueRefs[0]))?.size ?? 1;
+        if (linkedPrCount !== 1) {
+          candidate.rejectionReasons.push("linked issue is associated with another pull request");
+        }
       }
       if (!analysis.accepted) {
         candidate.rejectionReasons.push(
@@ -496,8 +614,13 @@ export async function runScan(
         progress(`Rejected ${repo.fullName}#${pr.number}: ${candidate.rejectionReasons.join("; ")}`);
         rejected.push(candidate);
         insertScanCandidate(db, scanId, repoId, prId, candidate);
+        syncRecordedCounts();
         continue;
       }
+      basicFilterPassesForRepo += 1;
+      candidate.basicFilterPassed = true;
+      liveProgress.currentRepoBasicFilterPasses = basicFilterPassesForRepo;
+      emitProgressState();
 
       let snapshot: Awaited<ReturnType<typeof prepareSnapshot>>;
       try {
@@ -517,6 +640,7 @@ export async function runScan(
         progress(`Rejected ${repo.fullName}#${pr.number}: failed to prepare snapshot (${err instanceof Error ? err.message : String(err)})`);
         rejected.push(candidate);
         insertScanCandidate(db, scanId, repoId, prId, candidate);
+        syncRecordedCounts();
         continue;
       }
       candidate.snapshot = snapshot;
@@ -529,29 +653,37 @@ export async function runScan(
           progress(`Rejected ${repo.fullName}#${pr.number}: snapshot exceeds max size (${snapshot.sizeBytes} bytes)`);
           rejected.push(candidate);
           insertScanCandidate(db, scanId, repoId, prId, candidate);
+          syncRecordedCounts();
           continue;
         }
 
-        progress(`Resolving Docker build plan for ${repo.fullName}#${pr.number}...`);
-        const { result: plan, timing: testPlanTiming } = await timeStep(
-          "test_plan",
-          candidateTimings,
-          () => resolveTestPlan(config, snapshot),
-          scanTimings,
-        );
-        candidate.testPlan = plan;
-        if (!plan) {
-          candidate.rejectionReasons.push("could not infer a Docker build plan");
+        if (config.dryRun) {
+          skipTiming("test_plan", candidateTimings, "dry-run mode", scanTimings);
+          skipTiming("docker_exec", candidateTimings, "dry-run mode", scanTimings);
           candidate.testsUnableToRun = true;
-          candidate.testsUnableToRunReason = "No Docker build plan could be inferred";
-          progress(`Rejected ${repo.fullName}#${pr.number}: could not infer a Docker build plan`);
-          rejected.push(candidate);
-          insertScanCandidate(db, scanId, repoId, prId, candidate);
-          continue;
-        }
-        progress(`Resolved ${plan.source} Docker build plan for ${repo.fullName}#${pr.number} in ${formatDuration(testPlanTiming.durationMs)}`);
+          candidate.testsUnableToRunReason = "Dry-run mode: Docker plan discovery and build validation skipped";
+          progress(`Skipped Docker plan discovery and build validation for ${repo.fullName}#${pr.number}: dry-run mode`);
+        } else {
+          progress(`Resolving Docker build plan for ${repo.fullName}#${pr.number}...`);
+          const { result: plan, timing: testPlanTiming } = await timeStep(
+            "test_plan",
+            candidateTimings,
+            () => resolveTestPlan(config, snapshot),
+            scanTimings,
+          );
+          candidate.testPlan = plan;
+          if (!plan) {
+            candidate.rejectionReasons.push("could not infer a Docker build plan");
+            candidate.testsUnableToRun = true;
+            candidate.testsUnableToRunReason = "No Docker build plan could be inferred";
+            progress(`Rejected ${repo.fullName}#${pr.number}: could not infer a Docker build plan`);
+            rejected.push(candidate);
+            insertScanCandidate(db, scanId, repoId, prId, candidate);
+            syncRecordedCounts();
+            continue;
+          }
+          progress(`Resolved ${plan.source} Docker build plan for ${repo.fullName}#${pr.number} in ${formatDuration(testPlanTiming.durationMs)}`);
 
-        if (!config.dryRun) {
           progress(`Running Docker build validation for ${repo.fullName}#${pr.number}...`);
 
           const { result: execution, timing: dockerExecTiming } = await timeStep(
@@ -570,7 +702,6 @@ export async function runScan(
             candidate.rejectionReasons.push("Docker build failed at pre-fix snapshot");
             candidate.testsUnableToRun = true;
             candidate.testsUnableToRunReason = "Docker build failed";
-            dockerBuildFailuresForRepo += 1;
 
             const failure = summarizeDockerFailure(candidate);
             if (failure) {
@@ -595,11 +726,6 @@ export async function runScan(
               progress(`Docker build verified for ${repo.fullName}#${pr.number}: ${buildEvidence}`);
             }
           }
-        } else {
-          skipTiming("docker_exec", candidateTimings, "dry-run mode", scanTimings);
-          candidate.testsUnableToRun = true;
-          candidate.testsUnableToRunReason = "Dry-run mode — Docker build validation skipped";
-          progress(`Skipped Docker build validation for ${repo.fullName}#${pr.number}: dry-run mode`);
         }
 
         if (candidate.rejectionReasons.length === 0) {
@@ -607,7 +733,12 @@ export async function runScan(
           accepted.push(candidate);
           foundAcceptedForRepo = true;
           insertScanCandidate(db, scanId, repoId, prId, candidate);
+          syncRecordedCounts();
           progress(`Accepted ${repo.fullName}#${pr.number}`);
+          if (!exhaustiveIssueScan && basicFilterPassesForRepo >= config.prLimit) {
+            progress(`Stopping ${repo.fullName}: reached basic-filter PR limit of ${config.prLimit}`);
+            break;
+          }
           continue;
         }
 
@@ -618,6 +749,7 @@ export async function runScan(
         progress(`Rejected ${repo.fullName}#${pr.number}: ${candidate.rejectionReasons.join("; ")}`);
         rejected.push(candidate);
         insertScanCandidate(db, scanId, repoId, prId, candidate);
+        syncRecordedCounts();
         if (repeatedDockerFailureSummary) {
           stoppedAfterRepeatedDockerFailures = true;
           progress(
@@ -625,6 +757,10 @@ export async function runScan(
               ? `Stopping ${repo.fullName}: repeated Docker failure fingerprint '${repeatedDockerFailureSummary}' detected, keeping already accepted PRs and skipping the rest`
               : `Stopping ${repo.fullName}: repeated Docker failure fingerprint '${repeatedDockerFailureSummary}' detected, treating the repo as rejected`,
           );
+          break;
+        }
+        if (!exhaustiveIssueScan && basicFilterPassesForRepo >= config.prLimit) {
+          progress(`Stopping ${repo.fullName}: reached basic-filter PR limit of ${config.prLimit}`);
           break;
         }
       } finally {
@@ -638,6 +774,7 @@ export async function runScan(
       rej.timings = [...timingsForRepo];
       rejected.push(rej);
       insertScanCandidate(db, scanId, repoId, null, rej);
+      syncRecordedCounts();
     } else if (!foundAcceptedForRepo && stoppedAfterRepeatedDockerFailures) {
       progress(`Rejected ${repo.fullName}: repeated Docker build failures with a matching fingerprint stopped the remaining PR checks`);
     }
@@ -652,6 +789,8 @@ export async function runScan(
         () => github.getRepository(config.targetRepo as string),
       );
       totalReposDiscovered += 1;
+      liveProgress.totalReposDiscovered = totalReposDiscovered;
+      emitProgressState();
       progress(`[deep-scan] Resolved ${repo.fullName} in ${formatDuration(repoResolveTiming.durationMs)}`);
       await processRepo(repo, config.languages, "[deep-scan]");
     } else {
@@ -670,6 +809,8 @@ export async function runScan(
           return true;
         });
         totalReposDiscovered += uniqueRepos.length;
+        liveProgress.totalReposDiscovered = totalReposDiscovered;
+        emitProgressState();
         const duplicateRepoCount = repos.length - uniqueRepos.length;
         progress(
           duplicateRepoCount > 0
@@ -696,6 +837,13 @@ export async function runScan(
       totalPullRequestsAnalyzed,
       totalCandidatesRecorded: accepted.length + rejected.length,
     });
+    liveProgress.totalReposDiscovered = totalReposDiscovered;
+    liveProgress.totalReposProcessed = totalReposProcessed;
+    liveProgress.totalPullRequestsAnalyzed = totalPullRequestsAnalyzed;
+    liveProgress.totalCandidatesRecorded = accepted.length + rejected.length;
+    liveProgress.acceptedCount = accepted.length;
+    liveProgress.rejectedCount = rejected.length;
+    emitProgressState();
     finishScan(db, scanId, "completed", totalDurationMs, accepted.length, rejected.length, performanceMetrics);
     progress(`Scan #${scanId} completed: ${accepted.length} accepted, ${rejected.length} rejected in ${formatDuration(totalDurationMs)}`);
     logPerformanceMetrics(performanceMetrics, onProgress);
@@ -725,6 +873,13 @@ export async function runScan(
       totalPullRequestsAnalyzed,
       totalCandidatesRecorded: accepted.length + rejected.length,
     });
+    liveProgress.totalReposDiscovered = totalReposDiscovered;
+    liveProgress.totalReposProcessed = totalReposProcessed;
+    liveProgress.totalPullRequestsAnalyzed = totalPullRequestsAnalyzed;
+    liveProgress.totalCandidatesRecorded = accepted.length + rejected.length;
+    liveProgress.acceptedCount = accepted.length;
+    liveProgress.rejectedCount = rejected.length;
+    emitProgressState();
     finishScan(db, scanId, "failed", totalDurationMs, accepted.length, rejected.length, performanceMetrics);
     progress(`Scan #${scanId} failed after ${formatDuration(totalDurationMs)}: ${err instanceof Error ? err.message : String(err)}`);
     logPerformanceMetrics(performanceMetrics, onProgress);

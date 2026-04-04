@@ -50,9 +50,10 @@ test("screenRepository reports missing requirements and archived repos clearly",
   );
 
   assert.equal(result.accepted, false);
+  assert.equal(result.hasDockerfile, false);
   assert.match(result.reasons.join(" | "), /repo is archived/i);
   assert.match(result.reasons.join(" | "), /missing standard package manager manifest/i);
-  assert.match(result.reasons.join(" | "), /missing Dockerfile/i);
   assert.match(result.reasons.join(" | "), /tests not detected/i);
   assert.match(result.reasons.join(" | "), /README does not look English enough/i);
+  assert.match(result.reasons.join(" | "), /README lacks clear build or test hints/i);
 });

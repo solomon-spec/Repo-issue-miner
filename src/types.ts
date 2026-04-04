@@ -11,10 +11,12 @@ export interface Config {
   buildTimeoutMs: number;
   testTimeoutMs: number;
   workRoot: string;
+  setupDefaultCloneRoot: string;
   outputRoot: string;
   dbPath: string;
   host: string;
   port: number;
+  codexCliPath?: string;
   minStars: number;
   repoLimit: number;
   repoConcurrency: number;
@@ -113,6 +115,7 @@ export interface PrAnalysis {
   relevantTestFiles: PullRequestFile[];
   touchedDirectories: string[];
   ignoredFiles: string[];
+  codeLinesChanged: number;
   nonTrivialScore: number;
   nonTrivialReasons: string[];
   accepted: boolean;
@@ -185,6 +188,20 @@ export interface ScanPerformanceMetrics {
   steps: ScanStepMetric[];
 }
 
+export interface ScanLiveProgress {
+  totalReposDiscovered: number;
+  totalReposProcessed: number;
+  totalPullRequestsAnalyzed: number;
+  totalCandidatesRecorded: number;
+  acceptedCount: number;
+  rejectedCount: number;
+  currentRepoFullName?: string;
+  currentRepoPullRequestsScanned?: number;
+  currentRepoPullRequestsTotal?: number;
+  currentRepoBasicFilterPasses?: number;
+  currentRepoPrLimit?: number;
+}
+
 export interface CandidateReport {
   repo: SearchRepo;
   screening: RepoScreening;
@@ -196,6 +213,7 @@ export interface CandidateReport {
   testPlan?: TestPlan;
   execution?: ExecutionResult;
   accepted: boolean;
+  basicFilterPassed: boolean;
   rejectionReasons: string[];
   timings: StepTiming[];
   testsUnableToRun: boolean;
@@ -317,4 +335,54 @@ export interface CodexTaskState {
   prContext?: CodexPrContext;
   prompts: PromptDraft[];
   rounds: CodexTaskRound[];
+}
+
+export type SetupSandboxMode = "workspace-write" | "danger-full-access";
+export type SetupRunStatus = "running" | "completed" | "failed" | "stopped";
+export type SetupTargetType = "repo" | "issue";
+
+export interface SetupProfile {
+  id: number;
+  name: string;
+  prompt: string;
+  contextPaths: string[];
+  writablePaths: string[];
+  validationPrompt: string;
+  cloneRootPath: string;
+  model?: string;
+  sandboxMode: SetupSandboxMode;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface SetupRunRecord {
+  id: number;
+  targetType: SetupTargetType;
+  targetLabel: string;
+  repoId: number;
+  repoFullName: string;
+  issueId?: number;
+  issueNumber?: number;
+  issueTitle?: string;
+  profileId?: number;
+  profileName?: string;
+  status: SetupRunStatus;
+  prompt: string;
+  contextPaths: string[];
+  writablePaths: string[];
+  validationPrompt: string;
+  cloneRootPath: string;
+  model?: string;
+  sandboxMode: SetupSandboxMode;
+  worktreePath?: string;
+  stdoutPath?: string;
+  stderrPath?: string;
+  lastMessagePath?: string;
+  diffPath?: string;
+  summary?: string;
+  changedFiles: string[];
+  violationFiles: string[];
+  error?: string;
+  startedAt: string;
+  finishedAt?: string;
 }

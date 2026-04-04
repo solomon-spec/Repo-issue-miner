@@ -27,11 +27,11 @@ test("chooseLanguageBucket prefers matching primary language when requested", ()
 
 test("analyzePullRequestFiles accepts non-trivial source changes with tests", () => {
   const analysis = analyzePullRequestFiles([
-    { filename: "src/app.ts", status: "modified", additions: 5, deletions: 1, changes: 6 },
-    { filename: "src/server.ts", status: "modified", additions: 8, deletions: 3, changes: 11 },
-    { filename: "src/http/router.ts", status: "modified", additions: 9, deletions: 2, changes: 11 },
-    { filename: "src/http/client.ts", status: "modified", additions: 7, deletions: 1, changes: 8 },
-    { filename: "src/db/store.ts", status: "modified", additions: 10, deletions: 2, changes: 12 },
+    { filename: "src/app.ts", status: "modified", additions: 56, deletions: 12, changes: 68 },
+    { filename: "src/server.ts", status: "modified", additions: 72, deletions: 18, changes: 90 },
+    { filename: "src/http/router.ts", status: "modified", additions: 64, deletions: 14, changes: 78 },
+    { filename: "src/http/client.ts", status: "modified", additions: 58, deletions: 10, changes: 68 },
+    { filename: "src/db/store.ts", status: "modified", additions: 61, deletions: 9, changes: 70 },
     { filename: "tests/app.spec.ts", status: "added", additions: 20, deletions: 0, changes: 20 },
     { filename: "package-lock.json", status: "modified", additions: 1, deletions: 1, changes: 2 },
   ], "typescript");
@@ -42,6 +42,7 @@ test("analyzePullRequestFiles accepts non-trivial source changes with tests", ()
   assert.deepEqual(analysis.touchedDirectories.sort(), ["src", "src/db", "src/http", "tests"]);
   assert.match(analysis.nonTrivialReasons.join(" "), /touches 5 relevant source files/i);
   assert.match(analysis.nonTrivialReasons.join(" "), /changes 1 test files/i);
+  assert.match(analysis.nonTrivialReasons.join(" "), /changes \d+ relevant code lines/i);
   assert.deepEqual(analysis.ignoredFiles, ["package-lock.json"]);
 });
 
