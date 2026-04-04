@@ -185,10 +185,11 @@
   }
 
   /* ---- Navigation ---- */
-  const pages = ["dashboard", "repos", "setup", "accepted", "issues", "scans", "new-scan"];
+  const pages = ["dashboard", "repos", "setup", "accepted", "tasks", "issues", "scans", "new-scan"];
   let currentPage = "dashboard";
   const selectedRepoIds = new Set();
   let visibleRepoIds = [];
+  let taskWorkspaceCandidateId = null;
   let selectedSetupTarget = null;
   let setupProfilesCache = [];
   let selectedSetupRunId = null;
@@ -250,6 +251,9 @@
         break;
       case "accepted":
         switchPage("accepted");
+        break;
+      case "tasks":
+        switchPage("tasks");
         break;
       case "rejected":
         switchPage("repos");
@@ -338,6 +342,11 @@
       primary_language: row.repo_primary_language || "",
       description: row.repo_description || "",
     });
+  }
+
+  function openTaskWorkspace(candidateId) {
+    taskWorkspaceCandidateId = candidateId ? String(candidateId) : null;
+    switchPage("tasks");
   }
 
   /* ---- Dashboard ---- */
@@ -1145,8 +1154,29 @@
   const ACCEPTED_PER_PAGE = 10;
   let acceptedReviewFilter = "all";
   let acceptedTestRunPoller = null;
+  let acceptedCodexReviewPoller = null;
+  let codexReviewReloadHandler = null;
   const activeAcceptedTestRuns = new Set();
+  const activeAcceptedCodexReviews = new Map();
   const expandedAcceptedRows = new Set();
+  const CODEX_AXIS_LABELS = {
+    preferred_output: "Preferred Output",
+    logic_and_correctness: "Logic and Correctness",
+    naming_and_clarity: "Naming and Clarity",
+    organization_and_modularity: "Organization and Modularity",
+    interface_design: "Interface Design",
+    error_handling: "Error Handling",
+    comments_and_documentation: "Comments and Documentation",
+    review_and_production_readiness: "Review / Production Readiness",
+  };
+  const CODEX_AXIS_OPTIONS = [
+    { value: "slight_a", label: "Slight A" },
+    { value: "a", label: "A" },
+    { value: "strong_a", label: "Strong A" },
+    { value: "slight_b", label: "Slight B" },
+    { value: "b", label: "B" },
+    { value: "strong_b", label: "Strong B" },
+  ];
 
   function manualReproUsage(details) {
     const state = details?.manualRepro || {};
@@ -1213,6 +1243,514 @@
       return `<span class="badge ${testState.lastRun.success ? "badge-completed" : "badge-rejected"}">${testState.lastRun.success ? "Docker Tests Passed" : "Docker Tests Failed"}</span>`;
     }
     return '<span class="badge badge-warn">Docker Tests Not Run</span>';
+  }
+
+  function codexTaskState(details) {
+    const state = details?.codexTask;
+    if (!state || typeof state.hfiUuid !== "string" || !state.hfiUuid.trim()) return null;
+    return {
+      hfiUuid: state.hfiUuid,
+      originalRepoPath: typeof state.originalRepoPath === "string" ? state.originalRepoPath : "",
+      worktreeAPath: typeof state.worktreeAPath === "string" ? state.worktreeAPath : "",
+      worktreeBPath: typeof state.worktreeBPath === "string" ? state.worktreeBPath : "",
+      testCommand: typeof state.testCommand === "string" ? state.testCommand : "",
+      currentRound: Number(state.currentRound) || 1,
+      maxPrompts: Number(state.maxPrompts) || 4,
+      issue: state.issue || null,
+      prContext: state.prContext || null,
+      prompts: Array.isArray(state.prompts) ? state.prompts : [],
+      rounds: Array.isArray(state.rounds) ? state.rounds : [],
+      updatedAt: typeof state.updatedAt === "string" ? state.updatedAt : null,
+    };
+  }
+
+  function codexRound(task, round) {
+    return (task?.rounds || []).find((item) => Number(item.round) === Number(round)) || null;
+  }
+
+  function codexPrompt(task, round) {
+    return (task?.prompts || []).find((item) => Number(item.round) === Number(round))?.prompt || "";
+  }
+
+  function codexTmux(task) {
+    if (!task?.hfiUuid) return null;
+    return {
+      attachA: `tmux attach -t ${task.hfiUuid}-A`,
+      attachB: `tmux attach -t ${task.hfiUuid}-B`,
+    };
+  }
+
+  function codexReviewBadge(activeReview, task) {
+    if (activeReview?.status === "running") {
+      return '<span class="badge badge-running">Codex Review Running</span>';
+    }
+    if ((task?.rounds || []).some((round) => round?.reviewDraft)) {
+      return '<span class="badge badge-completed">Draft Reviews Saved</span>';
+    }
+    return '<span class="badge badge-warn">No Codex Review Yet</span>';
+  }
+
+  function renderCodexAxisSelect(candidateId, round, axis, selected) {
+    return `
+      <label class="codex-axis-row">
+        <span>${esc(CODEX_AXIS_LABELS[axis] || axis)}</span>
+        <select data-codex-axis="${candidateId}" data-round="${round}" data-axis="${axis}">
+          ${CODEX_AXIS_OPTIONS.map((option) => `
+            <option value="${option.value}" ${selected === option.value ? "selected" : ""}>${option.label}</option>
+          `).join("")}
+        </select>
+      </label>
+    `;
+  }
+
+  function renderCodexDraftEditor(candidateId, round, draft) {
+    if (!draft) return "";
+    const axes = draft.axes || {};
+    return `
+      <div class="codex-draft-editor">
+        <div class="codex-draft-header">
+          <strong>Round ${round} Draft Review</strong>
+          <div class="accepted-card-actions">
+            <button type="button" class="btn btn-sm btn-info" data-copy-codex-next-prompt="${candidateId}" data-round="${round}">Copy Next Prompt</button>
+            <button type="button" class="btn btn-sm btn-info" data-save-codex-draft="${candidateId}" data-round="${round}">Save Draft</button>
+          </div>
+        </div>
+        <div class="codex-draft-grid">
+          <label class="form-group">
+            <span>Winner</span>
+            <select data-codex-draft-winner="${candidateId}" data-round="${round}">
+              <option value="A" ${draft.winner === "A" ? "selected" : ""}>A</option>
+              <option value="B" ${draft.winner === "B" ? "selected" : ""}>B</option>
+            </select>
+          </label>
+          <label class="form-group">
+            <span>Generated</span>
+            <input type="text" value="${esc(fmtDate(draft.generatedAt))}" readonly>
+          </label>
+        </div>
+        <label class="form-group">
+          <span>Response A Pros</span>
+          <textarea data-codex-field="${candidateId}" data-round="${round}" data-field="modelA.pros" class="accepted-review-notes">${esc(draft.modelA?.pros || "")}</textarea>
+        </label>
+        <label class="form-group">
+          <span>Response A Cons</span>
+          <textarea data-codex-field="${candidateId}" data-round="${round}" data-field="modelA.cons" class="accepted-review-notes">${esc(draft.modelA?.cons || "")}</textarea>
+        </label>
+        <label class="form-group">
+          <span>Response B Pros</span>
+          <textarea data-codex-field="${candidateId}" data-round="${round}" data-field="modelB.pros" class="accepted-review-notes">${esc(draft.modelB?.pros || "")}</textarea>
+        </label>
+        <label class="form-group">
+          <span>Response B Cons</span>
+          <textarea data-codex-field="${candidateId}" data-round="${round}" data-field="modelB.cons" class="accepted-review-notes">${esc(draft.modelB?.cons || "")}</textarea>
+        </label>
+        <div class="codex-axis-grid">
+          ${Object.keys(CODEX_AXIS_LABELS).map((axis) => renderCodexAxisSelect(candidateId, round, axis, axes[axis] || "slight_a")).join("")}
+        </div>
+        <label class="form-group">
+          <span>Overall Justification</span>
+          <textarea data-codex-field="${candidateId}" data-round="${round}" data-field="overallJustification" class="accepted-review-notes">${esc(draft.overallJustification || "")}</textarea>
+        </label>
+        <label class="form-group">
+          <span>Winner Unresolved Cons</span>
+          <textarea data-codex-field="${candidateId}" data-round="${round}" data-field="winnerUnresolvedCons" class="accepted-review-notes">${esc(Array.isArray(draft.winnerUnresolvedCons) ? draft.winnerUnresolvedCons.join("\n") : "")}</textarea>
+        </label>
+        <label class="form-group">
+          <span>Next Prompt</span>
+          <textarea data-codex-field="${candidateId}" data-round="${round}" data-field="nextPrompt" class="accepted-review-notes">${esc(draft.nextPrompt || "")}</textarea>
+        </label>
+        <label class="form-group">
+          <span>Confidence Notes</span>
+          <textarea data-codex-field="${candidateId}" data-round="${round}" data-field="confidenceNotes" class="accepted-review-notes">${esc(draft.confidenceNotes || "")}</textarea>
+        </label>
+      </div>
+    `;
+  }
+
+  function renderCodexTaskSummary(row, task, activeReview) {
+    const promptOne = task ? codexPrompt(task, 1) : "";
+    return `
+      <div class="accepted-review-panel codex-task-summary">
+        <div class="accepted-review-header">
+          <div class="accepted-card-title">
+            <strong>Codex Task Workspace</strong>
+            ${codexReviewBadge(activeReview, task)}
+            ${task ? `<span class="badge badge-info">Round ${task.currentRound} of ${task.maxPrompts}</span>` : '<span class="badge badge-warn">Not Started</span>'}
+          </div>
+          <span class="accepted-review-meta">${task?.updatedAt ? `Updated ${fmtDate(task.updatedAt)}` : "No task has been started for this candidate yet."}</span>
+        </div>
+        <p>${task
+          ? `Prompt 1 is ready${promptOne ? ` (${promptOne.split("\n")[0]})` : ""}. Open the dedicated Tasks page to manage the full workflow.`
+          : "Start the task from the dedicated Tasks page so Prompt 1, tmux capture, and round reviews stay in one workspace."}</p>
+        <div class="accepted-card-actions">
+          <button type="button" class="btn btn-sm btn-info" data-open-task-workspace="${row.id}">${task ? "Open Task Workspace" : "Start Task In Workspace"}</button>
+        </div>
+      </div>
+    `;
+  }
+
+  function renderCodexTaskPanel(row, task, activeReview) {
+    const tmux = codexTmux(task);
+    const currentRound = task?.currentRound || 1;
+    const currentPrompt = task ? codexPrompt(task, currentRound) : "";
+    const promptOne = task ? codexPrompt(task, 1) : "";
+    const issueTitle = task?.issue?.title || "";
+    const issueBody = task?.issue?.body || "";
+    const pr = task?.prContext || null;
+    const reviewRunPanel = `
+      <div class="tests-unable-rerun-panel accepted-test-run-panel codex-review-run-panel" data-codex-review-panel="${row.id}" hidden>
+        <div class="tests-unable-rerun-meta">
+          <span class="badge badge-running" data-codex-review-status-badge="${row.id}">running</span>
+          <span class="tests-unable-rerun-stage" data-codex-review-stage="${row.id}">Starting Codex review…</span>
+        </div>
+        <pre class="log-output log-output-compact tests-unable-live-output" data-codex-review-output="${row.id}">Waiting for Codex output…</pre>
+      </div>
+    `;
+    if (!task) {
+      return `
+        <div class="accepted-review-panel codex-task-panel">
+          <div class="accepted-review-header">
+            <div class="accepted-card-title">
+              <strong>Codex Task</strong>
+              <span class="badge badge-warn">Not Started</span>
+            </div>
+            <span class="accepted-review-meta">Generate Prompt 1 and Codex review drafts from the issue, actual PR context, worktrees, and tmux captures.</span>
+          </div>
+          <div class="codex-task-form codex-task-grid">
+            <label class="form-group">
+              <span>HFI UUID</span>
+              <input type="text" data-codex-start-field="${row.id}" data-field="hfiUuid" placeholder="uuid">
+            </label>
+            <label class="form-group">
+              <span>Original Repo Path</span>
+              <input type="text" data-codex-start-field="${row.id}" data-field="originalRepoPath" placeholder="/abs/path/to/repo">
+            </label>
+            <label class="form-group">
+              <span>Worktree A Path</span>
+              <input type="text" data-codex-start-field="${row.id}" data-field="worktreeAPath" placeholder="/abs/path/to/worktree-a">
+            </label>
+            <label class="form-group">
+              <span>Worktree B Path</span>
+              <input type="text" data-codex-start-field="${row.id}" data-field="worktreeBPath" placeholder="/abs/path/to/worktree-b">
+            </label>
+            <label class="form-group codex-task-wide">
+              <span>Test Command (Optional)</span>
+              <input type="text" data-codex-start-field="${row.id}" data-field="testCommand" placeholder="npm test">
+            </label>
+          </div>
+          <div class="accepted-card-actions">
+            <button type="button" class="btn btn-sm btn-info" data-start-codex-task="${row.id}">Start Task</button>
+          </div>
+        </div>
+      `;
+    }
+
+    return `
+      <div class="accepted-review-panel codex-task-panel">
+        <div class="accepted-review-header">
+          <div class="accepted-card-title">
+            <strong>Codex Task</strong>
+            <span class="badge badge-info">Round ${currentRound} of ${task.maxPrompts}</span>
+            ${codexReviewBadge(activeReview, task)}
+          </div>
+          <span class="accepted-review-meta">${task.updatedAt ? `Updated ${fmtDate(task.updatedAt)}` : "Not updated yet"}</span>
+        </div>
+        <div class="codex-task-form codex-task-grid">
+          <label class="form-group">
+            <span>HFI UUID</span>
+            <input type="text" data-codex-start-field="${row.id}" data-field="hfiUuid" value="${esc(task.hfiUuid)}">
+          </label>
+          <label class="form-group">
+            <span>Original Repo Path</span>
+            <input type="text" data-codex-start-field="${row.id}" data-field="originalRepoPath" value="${esc(task.originalRepoPath)}">
+          </label>
+          <label class="form-group">
+            <span>Worktree A Path</span>
+            <input type="text" data-codex-start-field="${row.id}" data-field="worktreeAPath" value="${esc(task.worktreeAPath)}">
+          </label>
+          <label class="form-group">
+            <span>Worktree B Path</span>
+            <input type="text" data-codex-start-field="${row.id}" data-field="worktreeBPath" value="${esc(task.worktreeBPath)}">
+          </label>
+          <label class="form-group codex-task-wide">
+            <span>Test Command (Optional)</span>
+            <input type="text" data-codex-start-field="${row.id}" data-field="testCommand" value="${esc(task.testCommand || "")}">
+          </label>
+        </div>
+        <div class="accepted-card-actions">
+          <button type="button" class="btn btn-sm btn-info" data-start-codex-task="${row.id}">Save Task</button>
+        </div>
+        <div class="codex-two-column">
+          <div class="codex-info-card">
+            <div class="manual-repro-header">
+              <strong>Original Issue</strong>
+            </div>
+            <p class="accepted-pr-title">${esc(issueTitle)}</p>
+            <pre class="log-output log-output-compact codex-prompt-output">${esc(issueBody || "No issue body saved for this candidate.")}</pre>
+          </div>
+          <div class="codex-info-card">
+            <div class="manual-repro-header">
+              <strong>Prompt 1</strong>
+              <button type="button" class="btn btn-sm btn-info" data-copy-codex-prompt="${row.id}" data-round="1">Copy</button>
+            </div>
+            <pre class="log-output log-output-compact codex-prompt-output" data-codex-prompt-text="${row.id}" data-round-prompt="1">${esc(promptOne)}</pre>
+          </div>
+        </div>
+        <div class="codex-info-card">
+          <div class="manual-repro-header">
+            <strong>Actual PR Context</strong>
+          </div>
+          <p><strong>${esc(pr?.title || row.pr_title || "No PR title saved")}</strong>${pr?.url || row.pr_url ? ` <a href="${esc(pr?.url || row.pr_url)}" target="_blank" class="repo-link">Open PR</a>` : ""}</p>
+          <p>${esc(pr?.body || "No PR body was available. The tool still uses the issue, file summary, and worktree evidence.")}</p>
+          <p>${typeof pr?.changedFilesCount === "number" ? `${pr.changedFilesCount} changed file(s)` : "Changed-file count unavailable"}</p>
+          ${Array.isArray(pr?.changedFiles) && pr.changedFiles.length ? `<div class="dockerfile-choice-list">${pr.changedFiles.map((file) => `<span class="dockerfile-choice">${esc(file.filename)}</span>`).join("")}</div>` : ""}
+        </div>
+        <div class="codex-info-card">
+          <div class="manual-repro-header">
+            <strong>Tmux Sessions</strong>
+          </div>
+          <p>The automatic review captures only the HFI trajectory sessions. Your own <code>task</code> session stays manual.</p>
+          <pre class="log-output log-output-compact codex-prompt-output">${esc(tmux?.attachA || "")}
+${esc(tmux?.attachB || "")}</pre>
+        </div>
+        <div class="codex-info-card">
+          <div class="manual-repro-header">
+            <strong>Current Round Prompt</strong>
+            <button type="button" class="btn btn-sm btn-info" data-copy-codex-prompt="${row.id}" data-round="${currentRound}">Copy</button>
+          </div>
+          <pre class="log-output log-output-compact codex-prompt-output" data-codex-prompt-text="${row.id}" data-round-prompt="${currentRound}">${esc(currentPrompt || "No prompt saved for this round yet.")}</pre>
+        </div>
+        <div class="codex-review-controls">
+          <label class="form-group">
+            <span>Round ${currentRound} Notes For Response A</span>
+            <textarea class="accepted-review-notes" data-codex-round-notes="${row.id}" data-round="${currentRound}" data-side="A">${esc(codexRound(task, currentRound)?.notesA || "")}</textarea>
+          </label>
+          <label class="form-group">
+            <span>Round ${currentRound} Notes For Response B</span>
+            <textarea class="accepted-review-notes" data-codex-round-notes="${row.id}" data-round="${currentRound}" data-side="B">${esc(codexRound(task, currentRound)?.notesB || "")}</textarea>
+          </label>
+          <div class="accepted-card-actions">
+            <button type="button" class="btn btn-sm btn-info" data-run-codex-review="${row.id}" data-round="${currentRound}">Generate Review</button>
+          </div>
+        </div>
+        ${reviewRunPanel}
+        ${(task.rounds || []).map((savedRound) => renderCodexDraftEditor(row.id, savedRound.round, savedRound.reviewDraft)).join("")}
+      </div>
+    `;
+  }
+
+  function renderAcceptedCodexReviewState(container, candidateId, state) {
+    const panel = $(`[data-codex-review-panel="${candidateId}"]`, container);
+    const badge = $(`[data-codex-review-status-badge="${candidateId}"]`, container);
+    const stage = $(`[data-codex-review-stage="${candidateId}"]`, container);
+    const output = $(`[data-codex-review-output="${candidateId}"]`, container);
+    const runButton = $(`[data-run-codex-review="${candidateId}"]`, container);
+    if (!panel || !badge || !stage || !output || !runButton) return;
+
+    const status = state?.status || "idle";
+    const isRunning = status === "running";
+    panel.hidden = status === "idle";
+    badge.className = `badge ${badgeClassForStatus(status)}`;
+    badge.textContent = status;
+    stage.textContent = state?.stage || (isRunning ? "Running Codex review…" : "Idle");
+    output.textContent = state?.liveOutput || (Array.isArray(state?.logs) ? state.logs.join("\n") : "Waiting for Codex output…");
+    output.scrollTop = output.scrollHeight;
+    runButton.disabled = isRunning;
+    runButton.textContent = isRunning ? "Generating Review…" : "Generate Review";
+  }
+
+  function stopAcceptedCodexReviewPolling() {
+    if (acceptedCodexReviewPoller) {
+      clearInterval(acceptedCodexReviewPoller);
+      acceptedCodexReviewPoller = null;
+    }
+  }
+
+  async function pollAcceptedCodexReviewStates(container) {
+    const entries = [...activeAcceptedCodexReviews.entries()];
+    if (!entries.length) {
+      stopAcceptedCodexReviewPolling();
+      return;
+    }
+
+    try {
+      const states = await Promise.all(entries.map(async ([candidateId, round]) => {
+        try {
+          return await api(`/api/accepted/${candidateId}/codex-task/round/${round}/status`);
+        } catch (err) {
+          return { candidateId, round, status: "failed", stage: err.message, liveOutput: "", logs: [], error: err.message };
+        }
+      }));
+
+      let shouldReload = false;
+      for (const state of states) {
+        renderAcceptedCodexReviewState(container, String(state.candidateId), state);
+        if (state.status === "running") continue;
+        activeAcceptedCodexReviews.delete(String(state.candidateId));
+        shouldReload = true;
+      }
+
+      if (shouldReload) {
+        if (typeof codexReviewReloadHandler === "function") {
+          await codexReviewReloadHandler();
+        }
+        return;
+      }
+
+      if (!activeAcceptedCodexReviews.size) {
+        stopAcceptedCodexReviewPolling();
+      }
+    } catch {
+      /* keep polling on transient failures */
+    }
+  }
+
+  function ensureCodexReviewPolling(container, reloadHandler) {
+    codexReviewReloadHandler = reloadHandler;
+    if (!activeAcceptedCodexReviews.size || acceptedCodexReviewPoller) return;
+    acceptedCodexReviewPoller = setInterval(() => {
+      void pollAcceptedCodexReviewStates(container);
+    }, 1500);
+  }
+
+  function readCodexDraftFromDom(container, candidateId, round) {
+    const winner = $(`[data-codex-draft-winner="${candidateId}"][data-round="${round}"]`, container)?.value || "A";
+    const readField = (field) => $(`[data-codex-field="${candidateId}"][data-round="${round}"][data-field="${field}"]`, container)?.value || "";
+    const axes = {};
+    Object.keys(CODEX_AXIS_LABELS).forEach((axis) => {
+      axes[axis] = $(`[data-codex-axis="${candidateId}"][data-round="${round}"][data-axis="${axis}"]`, container)?.value || "slight_a";
+    });
+    return {
+      winner,
+      modelA: {
+        pros: readField("modelA.pros"),
+        cons: readField("modelA.cons"),
+      },
+      modelB: {
+        pros: readField("modelB.pros"),
+        cons: readField("modelB.cons"),
+      },
+      axes,
+      overallJustification: readField("overallJustification"),
+      winnerUnresolvedCons: readField("winnerUnresolvedCons").split("\n").map((item) => item.trim()).filter(Boolean),
+      nextPrompt: readField("nextPrompt"),
+      confidenceNotes: readField("confidenceNotes"),
+    };
+  }
+
+  function bindCodexTaskInteractions(container, reloadHandler) {
+    $$("[data-copy-codex-prompt]", container).forEach((button) => {
+      button.addEventListener("click", async () => {
+        const candidateId = button.dataset.copyCodexPrompt;
+        const round = button.dataset.round;
+        const output = $(`[data-codex-prompt-text="${candidateId}"][data-round-prompt="${round}"]`, container);
+        if (!output) return;
+        const originalText = button.textContent;
+        button.disabled = true;
+        try {
+          await copyTextToClipboard(output.textContent || "");
+          button.textContent = "Copied";
+        } catch (err) {
+          alert("Failed to copy prompt: " + err.message);
+        } finally {
+          setTimeout(() => {
+            button.textContent = originalText;
+            button.disabled = false;
+          }, 1200);
+        }
+      });
+    });
+
+    $$("[data-start-codex-task]", container).forEach((button) => {
+      button.addEventListener("click", async () => {
+        const candidateId = button.dataset.startCodexTask;
+        const readField = (field) => $(`[data-codex-start-field="${candidateId}"][data-field="${field}"]`, container)?.value?.trim() || "";
+        button.disabled = true;
+        try {
+          await api(`/api/accepted/${candidateId}/start-task`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              hfiUuid: readField("hfiUuid"),
+              originalRepoPath: readField("originalRepoPath"),
+              worktreeAPath: readField("worktreeAPath"),
+              worktreeBPath: readField("worktreeBPath"),
+              testCommand: readField("testCommand") || undefined,
+            }),
+          });
+          await reloadHandler();
+        } catch (err) {
+          alert("Failed to start task: " + err.message);
+          button.disabled = false;
+        }
+      });
+    });
+
+    $$("[data-run-codex-review]", container).forEach((button) => {
+      button.addEventListener("click", async () => {
+        const candidateId = button.dataset.runCodexReview;
+        const round = button.dataset.round;
+        const notesA = $(`[data-codex-round-notes="${candidateId}"][data-round="${round}"][data-side="A"]`, container)?.value || "";
+        const notesB = $(`[data-codex-round-notes="${candidateId}"][data-round="${round}"][data-side="B"]`, container)?.value || "";
+        button.disabled = true;
+        button.textContent = "Generating Review…";
+        try {
+          const state = await api(`/api/accepted/${candidateId}/codex-task/round/${round}/review`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ notesA, notesB }),
+          });
+          activeAcceptedCodexReviews.set(String(candidateId), Number(round));
+          renderAcceptedCodexReviewState(container, candidateId, state);
+          ensureCodexReviewPolling(container, reloadHandler);
+          void pollAcceptedCodexReviewStates(container);
+        } catch (err) {
+          alert("Failed to generate Codex review: " + err.message);
+          button.disabled = false;
+          button.textContent = "Generate Review";
+        }
+      });
+    });
+
+    $$("[data-save-codex-draft]", container).forEach((button) => {
+      button.addEventListener("click", async () => {
+        const candidateId = button.dataset.saveCodexDraft;
+        const round = button.dataset.round;
+        button.disabled = true;
+        try {
+          await api(`/api/accepted/${candidateId}/codex-task/round/${round}/save-draft`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(readCodexDraftFromDom(container, candidateId, round)),
+          });
+          await reloadHandler();
+        } catch (err) {
+          alert("Failed to save Codex draft: " + err.message);
+          button.disabled = false;
+        }
+      });
+    });
+
+    $$("[data-copy-codex-next-prompt]", container).forEach((button) => {
+      button.addEventListener("click", async () => {
+        const candidateId = button.dataset.copyCodexNextPrompt;
+        const round = button.dataset.round;
+        const draft = readCodexDraftFromDom(container, candidateId, round);
+        const originalText = button.textContent;
+        button.disabled = true;
+        try {
+          await copyTextToClipboard(draft.nextPrompt || "");
+          button.textContent = "Copied";
+        } catch (err) {
+          alert("Failed to copy next prompt: " + err.message);
+        } finally {
+          setTimeout(() => {
+            button.textContent = originalText;
+            button.disabled = false;
+          }, 1200);
+        }
+      });
+    });
   }
 
   function renderAcceptedDockerfileChoices(candidateId, paths, selectedPath) {
@@ -1429,7 +1967,9 @@
   async function loadAccepted() {
     const container = $("#accepted-list");
     stopAcceptedTestRunPolling();
+    stopAcceptedCodexReviewPolling();
     activeAcceptedTestRuns.clear();
+    activeAcceptedCodexReviews.clear();
     try {
       const params = new URLSearchParams({
         limit: ACCEPTED_PER_PAGE,
@@ -1452,12 +1992,17 @@
 
       container.innerHTML = rows.map((row) => {
         const details = row.details || {};
+        const codexTask = codexTaskState(details);
         const usage = manualReproUsage(details);
         const review = reviewQueueState(details);
         const manualReview = manualReviewState(details);
         const dockerTest = acceptedDockerTestState(details);
         const activeTestRun = row.activeTestRun || null;
+        const activeCodexReview = row.activeCodexReview || null;
         if (activeTestRun?.status === "running") {
+          expandedAcceptedRows.add(String(row.id));
+        }
+        if (activeCodexReview?.status === "running") {
           expandedAcceptedRows.add(String(row.id));
         }
         const expanded = expandedAcceptedRows.has(String(row.id));
@@ -1504,6 +2049,7 @@
               <div class="accepted-card-actions">
                 <button type="button" class="btn btn-sm" data-setup-accepted="${row.id}">${setupButtonLabel}</button>
                 <button type="button" class="btn btn-sm btn-info" data-deep-scan-accepted="${esc(row.repo_full_name)}">Deep Scan Repo</button>
+                <button type="button" class="btn btn-sm btn-info" data-open-task-workspace="${row.id}">Open Task</button>
                 <button type="button" class="btn btn-sm" data-toggle-accepted-details="${row.id}" aria-expanded="${expanded ? "true" : "false"}">${expanded ? "Hide Details" : "View Details"}</button>
               </div>
             </div>
@@ -1604,6 +2150,7 @@
             </div>
             ${manualReview.rejected ? `<p class="accepted-reasons">${esc(manualReview.reason || "manually rejected by user")}</p>` : ""}
             ${reasons.length ? `<p class="accepted-reasons">${esc(reasons.join(" · "))}</p>` : ""}
+            ${renderCodexTaskSummary(row, codexTask, activeCodexReview)}
             ${manualRepro ? renderManualReproBlock(`accepted-${row.id}`, manualRepro) : ""}
             </div>
           </div>
@@ -1611,6 +2158,11 @@
       }).join("");
 
       attachManualReproCopyHandlers(container);
+
+      bindCodexTaskInteractions(container, loadAccepted);
+      $$("[data-open-task-workspace]", container).forEach((button) => {
+        button.addEventListener("click", () => openTaskWorkspace(button.dataset.openTaskWorkspace));
+      });
 
       $$("[data-toggle-manual-repro-used]", container).forEach((button) => {
         button.addEventListener("click", async () => {
@@ -1948,8 +2500,18 @@
           activeAcceptedTestRuns.add(String(row.id));
         }
       });
+      rows.forEach((row) => {
+        if (!row.activeCodexReview) return;
+        renderAcceptedCodexReviewState(container, String(row.id), row.activeCodexReview);
+        if (row.activeCodexReview.status === "running") {
+          activeAcceptedCodexReviews.set(String(row.id), Number(row.activeCodexReview.round || 1));
+        }
+      });
       if (activeAcceptedTestRuns.size) {
         ensureAcceptedTestRunPolling(container);
+      }
+      if (activeAcceptedCodexReviews.size) {
+        ensureCodexReviewPolling(container, loadAccepted);
       }
 
       renderPagination($("#accepted-pagination"), data.total, ACCEPTED_PER_PAGE, acceptedPage, (page) => {
@@ -1967,6 +2529,97 @@
     acceptedPage = 0;
     void loadAccepted();
   });
+
+  async function loadTasksPage() {
+    const container = $("#task-workspace");
+    stopAcceptedCodexReviewPolling();
+    activeAcceptedCodexReviews.clear();
+    try {
+      const data = await api("/api/accepted?limit=100&offset=0&reviewStatus=all");
+      if (!Array.isArray(data.rows) || !data.rows.length) {
+        container.innerHTML = `<div class="card"><div class="empty-state"><div class="empty-icon">🧠</div><p>No accepted candidates are available for task workspaces yet.</p></div></div>`;
+        return;
+      }
+
+      const rows = data.rows;
+      const selected = rows.find((row) => String(row.id) === String(taskWorkspaceCandidateId)) ?? rows[0];
+      taskWorkspaceCandidateId = String(selected.id);
+      const selectedDetails = selected.details || {};
+      const selectedTask = codexTaskState(selectedDetails);
+      const activeCodexReview = selected.activeCodexReview || null;
+
+      container.innerHTML = `
+        <div class="card task-workspace-shell">
+          <div class="task-selector-list">
+            ${rows.map((row) => {
+              const task = codexTaskState(row.details || {});
+              return `
+                <button
+                  type="button"
+                  class="task-selector-item ${String(row.id) === String(taskWorkspaceCandidateId) ? "active" : ""}"
+                  data-task-select="${row.id}"
+                >
+                  <strong>${esc(row.repo_full_name)}</strong>
+                  <span>PR #${row.pr_number || "—"}</span>
+                  <span>${esc(row.pr_title || "No PR title saved")}</span>
+                  <span>${task ? `Round ${task.currentRound}/${task.maxPrompts}` : "Task not started"}</span>
+                </button>
+              `;
+            }).join("")}
+          </div>
+          <div class="task-workspace-main">
+            <div class="card accepted-card accepted-card-task">
+              <div class="accepted-card-header">
+                <div class="accepted-card-summary">
+                  <div class="accepted-card-summary-main">
+                    <strong>${esc(selected.repo_full_name)}</strong>
+                    <a href="${esc(selected.pr_url || "#")}" target="_blank" class="repo-link">PR #${selected.pr_number || "—"}</a>
+                    ${codexReviewBadge(activeCodexReview, selectedTask)}
+                  </div>
+                  <div class="accepted-card-summary-sub">
+                    <span>${esc(selected.pr_title || "No PR title saved")}</span>
+                    <span>${Array.isArray(selected.issues) ? selected.issues.length : 0} issue${Array.isArray(selected.issues) && selected.issues.length === 1 ? "" : "s"}</span>
+                  </div>
+                </div>
+                <div class="accepted-card-actions">
+                  <button type="button" class="btn btn-sm" data-task-open-accepted="${selected.id}">Open In Accepted</button>
+                </div>
+              </div>
+              <div class="accepted-card-body">
+                ${renderCodexTaskPanel(selected, selectedTask, activeCodexReview)}
+              </div>
+            </div>
+          </div>
+        </div>
+      `;
+
+      $$("[data-task-select]", container).forEach((button) => {
+        button.addEventListener("click", () => {
+          taskWorkspaceCandidateId = button.dataset.taskSelect;
+          void loadTasksPage();
+        });
+      });
+      $$("[data-task-open-accepted]", container).forEach((button) => {
+        button.addEventListener("click", () => {
+          expandedAcceptedRows.add(String(button.dataset.taskOpenAccepted));
+          switchPage("accepted");
+        });
+      });
+      bindCodexTaskInteractions(container, loadTasksPage);
+
+      if (activeCodexReview) {
+        renderAcceptedCodexReviewState(container, String(selected.id), activeCodexReview);
+        if (activeCodexReview.status === "running") {
+          activeAcceptedCodexReviews.set(String(selected.id), Number(activeCodexReview.round || selectedTask?.currentRound || 1));
+        }
+      }
+      if (activeAcceptedCodexReviews.size) {
+        ensureCodexReviewPolling(container, loadTasksPage);
+      }
+    } catch (err) {
+      container.innerHTML = `<div class="card"><div class="empty-state"><p>Error: ${err.message}</p></div></div>`;
+    }
+  }
 
   /* ---- Issues ---- */
   let issuesPage = 0;
@@ -2739,6 +3392,7 @@
       case "repos": loadRepos(); break;
       case "setup": loadSetup(); break;
       case "accepted": loadAccepted(); break;
+      case "tasks": loadTasksPage(); break;
       case "issues": loadIssues(); break;
       case "scans": loadScans(); break;
       case "new-scan": checkActiveScan(); break;

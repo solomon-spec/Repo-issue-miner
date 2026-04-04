@@ -234,6 +234,109 @@ export interface ScanReport {
   rejected: CandidateReport[];
 }
 
+export type CodexAxisName =
+  | "preferred_output"
+  | "logic_and_correctness"
+  | "naming_and_clarity"
+  | "organization_and_modularity"
+  | "interface_design"
+  | "error_handling"
+  | "comments_and_documentation"
+  | "review_and_production_readiness";
+
+export type CodexAxisPreference =
+  | "slight_a"
+  | "a"
+  | "strong_a"
+  | "slight_b"
+  | "b"
+  | "strong_b";
+
+export interface CodexAxisRating {
+  axis: CodexAxisName;
+  preference: CodexAxisPreference;
+}
+
+export interface PromptDraft {
+  round: number;
+  prompt: string;
+  source: "issue_rewrite" | "review_follow_up";
+  generatedAt: string;
+}
+
+export interface CodexIssueSource {
+  owner?: string;
+  repo?: string;
+  number?: number;
+  url?: string;
+  title: string;
+  body?: string;
+  selectedFromCount: number;
+}
+
+export interface CodexPrChangedFileSummary {
+  filename: string;
+  additions: number;
+  deletions: number;
+  changes: number;
+  status: string;
+}
+
+export interface CodexPrContext {
+  number?: number;
+  url?: string;
+  title?: string;
+  body?: string;
+  mergedAt?: string | null;
+  changedFilesCount?: number;
+  changedFiles: CodexPrChangedFileSummary[];
+  fetchedAt: string;
+}
+
+export interface CodexReviewModelNotes {
+  pros: string;
+  cons: string;
+}
+
+export interface CodexReviewDraft {
+  winner: "A" | "B";
+  modelA: CodexReviewModelNotes;
+  modelB: CodexReviewModelNotes;
+  axes: Record<CodexAxisName, CodexAxisPreference>;
+  overallJustification: string;
+  winnerUnresolvedCons: string[];
+  nextPrompt: string;
+  confidenceNotes: string;
+  generatedAt: string;
+  artifactDir?: string;
+}
+
+export interface CodexTaskRound {
+  round: number;
+  notesA?: string;
+  notesB?: string;
+  reviewDraft?: CodexReviewDraft;
+  artifactDir?: string;
+  generatedAt?: string;
+  promptGeneratedForNextRound?: number;
+}
+
+export interface CodexTaskState {
+  hfiUuid: string;
+  originalRepoPath: string;
+  worktreeAPath: string;
+  worktreeBPath: string;
+  testCommand?: string;
+  currentRound: number;
+  maxPrompts: number;
+  startedAt: string;
+  updatedAt: string;
+  issue: CodexIssueSource;
+  prContext?: CodexPrContext;
+  prompts: PromptDraft[];
+  rounds: CodexTaskRound[];
+}
+
 export type SetupSandboxMode = "workspace-write" | "danger-full-access";
 export type SetupRunStatus = "running" | "completed" | "failed" | "stopped";
 export type SetupTargetType = "repo" | "issue";

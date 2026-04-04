@@ -8,6 +8,7 @@
     "build": "tsc -p tsconfig.json",
     "clean-db": "node dist/index.js clean-db",
     "start": "node dist/index.js",
+    "test": "npm run build && node --test tests/**/*.test.mjs",
     "scan": "node dist/index.js scan",
     "serve": "node dist/index.js serve",
     "serve:lan": "node dist/index.js serve --host 0.0.0.0",
