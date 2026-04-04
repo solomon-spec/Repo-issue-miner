@@ -4,6 +4,8 @@ import { unique, withTimeoutSignal } from "./util.js";
 const DEFAULT_CACHE_TTL_MS = 5 * 60 * 1000;
 const LONG_CACHE_TTL_MS = 30 * 60 * 1000;
 const MAX_CACHE_ENTRIES = 256;
+const MAX_REQUEST_ATTEMPTS = 3;
+const RETRYABLE_STATUS_CODES = new Set([429, 500, 502, 503, 504]);
 
 interface GraphqlResponse<T> {
   data?: T;
@@ -132,8 +134,49 @@ function stableValue(input: unknown): unknown {
   return input;
 }
 
+function graphqlOperationName(query: string): string {
+  const match = query.match(/\b(?:query|mutation)\s+([A-Za-z0-9_]+)/);
+  return match?.[1] ?? "anonymous";
+}
+
 export class GitHubClient {
   constructor(private readonly config: Config) {}
+
+  private async sleep(ms: number): Promise<void> {
+    await new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  private shouldRetryStatus(status: number): boolean {
+    return RETRYABLE_STATUS_CODES.has(status);
+  }
+
+  private async fetchWithRetries(
+    url: string,
+    initFactory: () => RequestInit,
+    context: string,
+  ): Promise<Response> {
+    let lastError: unknown;
+
+    for (let attempt = 1; attempt <= MAX_REQUEST_ATTEMPTS; attempt += 1) {
+      try {
+        const response = await fetch(url, initFactory());
+        if (response.ok || !this.shouldRetryStatus(response.status) || attempt === MAX_REQUEST_ATTEMPTS) {
+          return response;
+        }
+        lastError = new Error(`${response.status} ${response.statusText}`);
+      } catch (err) {
+        lastError = err;
+        if (attempt === MAX_REQUEST_ATTEMPTS) {
+          break;
+        }
+      }
+
+      await this.sleep(250 * attempt);
+    }
+
+    const message = lastError instanceof Error ? lastError.message : String(lastError ?? "unknown error");
+    throw new Error(`${context}: ${message}`);
+  }
 
   private buildHeaders(extra?: Record<string, string>): Record<string, string> {
     const headers: Record<string, string> = {
@@ -184,21 +227,26 @@ export class GitHubClient {
     if (cached !== undefined) {
       return cached;
     }
-    const response = await fetch("https://api.github.com/graphql", {
-      method: "POST",
-      headers: this.buildHeaders({ "Content-Type": "application/json" }),
-      body: JSON.stringify({ query, variables }),
-      signal: withTimeoutSignal(this.config.requestTimeoutMs),
-    });
+    const operation = graphqlOperationName(query);
+    const response = await this.fetchWithRetries(
+      "https://api.github.com/graphql",
+      () => ({
+        method: "POST",
+        headers: this.buildHeaders({ "Content-Type": "application/json" }),
+        body: JSON.stringify({ query, variables }),
+        signal: withTimeoutSignal(this.config.requestTimeoutMs),
+      }),
+      `GitHub GraphQL request failed for ${operation}`,
+    );
     if (!response.ok) {
-      throw new Error(`GitHub GraphQL request failed: ${response.status} ${response.statusText}`);
+      throw new Error(`GitHub GraphQL request failed for ${operation}: ${response.status} ${response.statusText}`);
     }
     const payload = (await response.json()) as GraphqlResponse<T>;
     if (payload.errors?.length) {
-      throw new Error(`GitHub GraphQL error: ${payload.errors.map((item) => item.message).join(" | ")}`);
+      throw new Error(`GitHub GraphQL error for ${operation}: ${payload.errors.map((item) => item.message).join(" | ")}`);
     }
     if (!payload.data) {
-      throw new Error("GitHub GraphQL request returned no data");
+      throw new Error(`GitHub GraphQL request returned no data for ${operation}`);
     }
     this.setCached(cacheKey, payload.data, cacheTtlMs);
     return payload.data;
@@ -215,10 +263,14 @@ export class GitHubClient {
     if (cached !== undefined) {
       return cached;
     }
-    const response = await fetch(`https://api.github.com${path}`, {
-      headers: this.buildHeaders(extraHeaders),
-      signal: withTimeoutSignal(timeoutMs),
-    });
+    const response = await this.fetchWithRetries(
+      `https://api.github.com${path}`,
+      () => ({
+        headers: this.buildHeaders(extraHeaders),
+        signal: withTimeoutSignal(timeoutMs),
+      }),
+      `GitHub REST request failed for ${path}`,
+    );
     if (!response.ok) {
       throw new Error(`GitHub REST request failed for ${path}: ${response.status} ${response.statusText}`);
     }
@@ -238,10 +290,14 @@ export class GitHubClient {
     if (cached !== undefined) {
       return cached;
     }
-    const response = await fetch(`https://api.github.com${path}`, {
-      headers: this.buildHeaders(extraHeaders),
-      signal: withTimeoutSignal(timeoutMs),
-    });
+    const response = await this.fetchWithRetries(
+      `https://api.github.com${path}`,
+      () => ({
+        headers: this.buildHeaders(extraHeaders),
+        signal: withTimeoutSignal(timeoutMs),
+      }),
+      `GitHub REST request failed for ${path}`,
+    );
     if (!response.ok) {
       throw new Error(`GitHub REST request failed for ${path}: ${response.status} ${response.statusText}`);
     }
@@ -329,6 +385,15 @@ export class GitHubClient {
       diskUsageKb: typeof repo.size === "number" ? repo.size : undefined,
       description: typeof repo.description === "string" ? repo.description : undefined,
     };
+  }
+
+  async getBranchHeadSha(repo: SearchRepo, branchName = repo.defaultBranch): Promise<string> {
+    const ref = await this.rest<Record<string, unknown>>(`/repos/${repo.owner}/${repo.name}/git/ref/heads/${encodeURIComponent(branchName)}`);
+    const object = ref.object as Record<string, unknown> | undefined;
+    if (!object || typeof object.sha !== "string" || !object.sha) {
+      throw new Error(`could not resolve ${repo.fullName}@${branchName} to a commit SHA`);
+    }
+    return object.sha;
   }
 
   private mapRepoSearchNode(node: RepoSearchNode): SearchRepo {

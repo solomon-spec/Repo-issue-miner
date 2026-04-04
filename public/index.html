@@ -21,6 +21,7 @@
       <ul class="nav-links">
         <li><a href="#" data-page="dashboard" class="active" id="nav-dashboard"><span class="nav-icon">📊</span> Dashboard</a></li>
         <li><a href="#" data-page="repos" id="nav-repos"><span class="nav-icon">📦</span> Repos</a></li>
+        <li><a href="#" data-page="setup" id="nav-setup"><span class="nav-icon">🛠️</span> Setup</a></li>
         <li><a href="#" data-page="accepted" id="nav-accepted"><span class="nav-icon">✅</span> Accepted</a></li>
         <li><a href="#" data-page="issues" id="nav-issues"><span class="nav-icon">🐛</span> Issues</a></li>
         <li><a href="#" data-page="scans" id="nav-scans"><span class="nav-icon">🔍</span> Scans</a></li>
@@ -61,10 +62,132 @@
         </div>
         <div class="card">
           <div class="table-wrap"><table id="repos-table">
-            <thead><tr><th><input type="checkbox" id="select-all-repos" aria-label="Select all repos"></th><th>Repo</th><th>Stars</th><th>Language</th><th>PRs</th><th>Issues</th><th>Status</th><th>Actions</th></tr></thead>
+            <thead><tr><th><input type="checkbox" id="select-all-repos" aria-label="Select all repos"></th><th>Repo</th><th>Stars</th><th>Language</th><th>PR Progress</th><th>Issues</th><th>Status</th><th>Actions</th></tr></thead>
             <tbody id="repos-tbody"></tbody>
           </table></div>
           <div class="pagination" id="repos-pagination"></div>
+        </div>
+      </section>
+
+      <section id="page-setup" class="page">
+        <h2 class="page-title">Setup</h2>
+        <p class="page-subtitle">Run Codex against a fresh setup snapshot, review the output live, and keep reusable setup profiles for Dockerfiles, README updates, validation prompts, and clone roots.</p>
+
+        <div class="card">
+          <div class="setup-launch-header">
+            <div>
+              <h3>Start Setup Task</h3>
+              <p class="form-helper">Pick a repo or a specific issue, choose a profile, then let Codex prepare the codebase inside an isolated snapshot. Issue targets use the linked fix PR base/pre-fix commit, and completed setup runs create the PR Writer setup commit automatically.</p>
+            </div>
+            <div class="setup-launch-actions">
+              <button type="button" class="btn btn-sm" id="setup-clear-target">Clear Target</button>
+            </div>
+          </div>
+          <div class="setup-launch-grid">
+            <div class="setup-selected-repo" id="setup-selected-target">
+              <strong>No target selected</strong>
+              <span>Choose `Setup` from the repo list or the issues list to target a repository or a specific issue.</span>
+            </div>
+            <form id="setup-run-form" class="setup-run-form">
+              <div class="form-group">
+                <label for="setup-profile-select">Setup Profile</label>
+                <select id="setup-profile-select"></select>
+              </div>
+              <button type="submit" class="btn btn-primary" id="setup-start-button">Start Setup</button>
+            </form>
+          </div>
+        </div>
+
+        <div class="setup-layout">
+          <div class="card">
+            <div class="setup-card-header">
+              <h3>Profiles</h3>
+              <button type="button" class="btn btn-sm btn-info" id="setup-new-profile">New Profile</button>
+            </div>
+            <div id="setup-profile-list" class="setup-profile-list"></div>
+          </div>
+
+          <div class="card">
+            <div class="setup-card-header">
+              <h3 id="setup-profile-editor-title">Edit Profile</h3>
+              <button type="button" class="btn btn-sm btn-danger" id="setup-delete-profile" disabled>Delete</button>
+            </div>
+            <form id="setup-profile-form">
+              <input type="hidden" id="setup-profile-id">
+              <div class="form-grid setup-form-grid">
+                <div class="form-group">
+                  <label for="setup-profile-name">Name</label>
+                  <input type="text" id="setup-profile-name" placeholder="Docker Setup">
+                </div>
+                <div class="form-group">
+                  <label for="setup-profile-model">Model (optional)</label>
+                  <input type="text" id="setup-profile-model" placeholder="Leave blank for local Codex default">
+                </div>
+                <div class="form-group setup-form-span-2">
+                  <label for="setup-profile-clone-root">Clone Root Path</label>
+                  <input type="text" id="setup-profile-clone-root" placeholder="~/Documents/pr-writer-tasks">
+                  <p class="form-helper">Snapshots for setup tasks will be created under this path. Default is `~/Documents/pr-writer-tasks`.</p>
+                </div>
+                <div class="form-group">
+                  <label for="setup-profile-sandbox">Sandbox</label>
+                  <select id="setup-profile-sandbox">
+                    <option value="danger-full-access">Danger Full Access (Recommended for setup tests)</option>
+                    <option value="workspace-write">Workspace Write</option>
+                  </select>
+                </div>
+                <div class="form-group setup-form-span-2">
+                  <label for="setup-profile-prompt">Prompt</label>
+                  <textarea id="setup-profile-prompt" placeholder="Prepare this repository for later issue work. Create or improve a root Dockerfile, update native README instructions, pin dependencies, remove lock files, and do not touch source code."></textarea>
+                </div>
+                <div class="form-group">
+                  <label for="setup-profile-context-paths">Context Files / Globs</label>
+                  <textarea id="setup-profile-context-paths" placeholder="README*&#10;package.json&#10;pyproject.toml&#10;Dockerfile"></textarea>
+                  <p class="form-helper">One relative path or glob per line. These are the files Codex is told to read first.</p>
+                </div>
+                <div class="form-group">
+                  <label for="setup-profile-writable-paths">Writable Files / Globs</label>
+                  <textarea id="setup-profile-writable-paths" placeholder="Dockerfile&#10;README*&#10;requirements*.txt&#10;package.json"></textarea>
+                  <p class="form-helper">Changes outside these paths will be flagged in the run summary.</p>
+                </div>
+                <div class="form-group setup-form-span-2">
+                  <label for="setup-profile-validation-prompt">Validation Prompt</label>
+                  <textarea id="setup-profile-validation-prompt" placeholder="Run the most appropriate build, test, lint, or Docker checks you can infer from the repo. Tell me what passed and what still needs manual follow-up."></textarea>
+                  <p class="form-helper">Describe how Codex should validate its work instead of hardcoding exact commands.</p>
+                </div>
+              </div>
+              <div class="setup-form-actions">
+                <button type="submit" class="btn btn-primary" id="setup-save-profile">Save Profile</button>
+                <button type="button" class="btn btn-sm" id="setup-reset-profile">Reset</button>
+              </div>
+            </form>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="setup-card-header">
+            <h3>Recent Runs</h3>
+            <button type="button" class="btn btn-sm" id="setup-refresh-runs">Refresh</button>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr><th>Run</th><th>Target</th><th>Repo</th><th>Profile</th><th>Status</th><th>Started</th><th>Actions</th></tr>
+              </thead>
+              <tbody id="setup-runs-tbody"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="setup-card-header">
+            <h3>Run Detail</h3>
+            <div class="setup-card-actions">
+              <button type="button" class="btn btn-sm btn-danger" id="setup-stop-run" disabled>Stop Run</button>
+            </div>
+          </div>
+          <div id="setup-run-detail" class="setup-run-detail">
+            <div class="empty-state"><div class="empty-icon">🧪</div><p>Select a setup run to inspect its prompt, output, changed files, and diff.</p></div>
+          </div>
         </div>
       </section>
 
@@ -96,7 +219,7 @@
         <h2 class="page-title">Verified Issues</h2>
         <div class="card">
           <div class="table-wrap"><table id="issues-table">
-            <thead><tr><th>Issue</th><th>Repo</th><th>PR</th><th>State</th><th>Link Type</th></tr></thead>
+            <thead><tr><th>Issue</th><th>Repo</th><th>PR</th><th>State</th><th>Link Type</th><th>Actions</th></tr></thead>
             <tbody id="issues-tbody"></tbody>
           </table></div>
           <div class="pagination" id="issues-pagination"></div>
@@ -170,7 +293,7 @@
               </div>
               <div class="form-group">
                 <label for="f-min-stars">Min Stars</label>
-                <input type="number" id="f-min-stars" value="50" min="0">
+                <input type="number" id="f-min-stars" value="200" min="0">
               </div>
               <div class="form-group">
                 <label for="f-target-repo">Single Repo Deep Scan</label>
@@ -182,7 +305,7 @@
                 <input type="date" id="f-merged-after">
               </div>
               <div class="form-group">
-                <label class="cb-label"><input type="checkbox" id="f-dry-run"> Dry Run (skip Docker)</label>
+                <label class="cb-label"><input type="checkbox" id="f-dry-run" checked> Dry Run (default; skip Docker checks)</label>
               </div>
             </div>
             <button type="submit" class="btn btn-primary" id="scan-submit">🚀 Start Scan</button>
@@ -193,6 +316,7 @@
         <div class="card" id="scan-log-card" style="display:none;">
           <h3>Scan Progress <span class="badge badge-pulse" id="scan-running-badge">Running</span></h3>
           <p class="scan-status-text" id="scan-status-text">Waiting for scan activity...</p>
+          <div id="scan-live-summary" class="scan-performance" style="display:none;"></div>
           <div id="scan-performance-summary" class="scan-performance" style="display:none;"></div>
           <pre id="scan-log-output" class="log-output"></pre>
         </div>

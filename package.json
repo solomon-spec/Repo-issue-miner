@@ -6,6 +6,7 @@
   "description": "Mine GitHub repos and merged PRs with linked issues, then validate pre-fix snapshots in Docker. Includes web dashboard and SQLite persistence.",
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "clean-db": "node dist/index.js clean-db",
     "start": "node dist/index.js",
     "scan": "node dist/index.js scan",
     "serve": "node dist/index.js serve",

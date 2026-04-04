@@ -45,11 +45,17 @@ export function loadConfig(argv: string[] = []): Config {
     buildTimeoutMs: parseInteger(byFlag.get("build-timeout-ms") ?? process.env.BUILD_TIMEOUT_MS, 20 * 60 * 1000),
     testTimeoutMs: parseInteger(byFlag.get("test-timeout-ms") ?? process.env.TEST_TIMEOUT_MS, 20 * 60 * 1000),
     workRoot: resolve(byFlag.get("work-root") ?? process.env.WORK_ROOT ?? `${homedir()}/repo-issue-miner-work`),
+    setupDefaultCloneRoot: resolve(
+      byFlag.get("setup-clone-root")
+        ?? process.env.SETUP_CLONE_ROOT
+        ?? `${homedir()}/Documents/pr-writer-tasks`,
+    ),
     outputRoot: resolve(byFlag.get("output-root") ?? process.env.OUTPUT_ROOT ?? `${process.cwd()}/output`),
     dbPath: resolve(byFlag.get("db-path") ?? process.env.DB_PATH ?? `${process.cwd()}/data/repo-miner.db`),
     host: byFlag.get("host") ?? process.env.HOST ?? "127.0.0.1",
     port: parseInteger(byFlag.get("port") ?? process.env.PORT, 3000),
-    minStars: parseInteger(byFlag.get("min-stars") ?? process.env.MIN_STARS, 50),
+    codexCliPath: byFlag.get("codex-cli-path") ?? process.env.CODEX_CLI_PATH,
+    minStars: parseInteger(byFlag.get("min-stars") ?? process.env.MIN_STARS, 200),
     repoLimit: parseInteger(byFlag.get("repo-limit") ?? process.env.REPO_LIMIT, 10),
     repoConcurrency: Math.max(1, parseInteger(byFlag.get("repo-concurrency") ?? process.env.REPO_CONCURRENCY, 2)),
     prLimit: parseInteger(byFlag.get("pr-limit") ?? process.env.PR_LIMIT, 10),
@@ -57,7 +63,7 @@ export function loadConfig(argv: string[] = []): Config {
     languages: parseLanguages(byFlag.get("languages") ?? process.env.LANGUAGES),
     scanMode: parseScanMode(byFlag.get("scan-mode") ?? process.env.SCAN_MODE),
     targetRepo: byFlag.get("target-repo") ?? process.env.TARGET_REPO,
-    dryRun: parseBooleanFlag(byFlag.get("dry-run") ?? process.env.DRY_RUN, false),
+    dryRun: parseBooleanFlag(byFlag.get("dry-run") ?? process.env.DRY_RUN, true),
     keepWorktree: parseBooleanFlag(byFlag.get("keep-worktree") ?? process.env.KEEP_WORKTREE, false),
   };
 }

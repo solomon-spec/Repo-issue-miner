@@ -26,7 +26,6 @@ export function screenRepository(repo: SearchRepo, tree: RepoTreeItem[], readme?
 
   if (repo.isArchived) reasons.push("repo is archived");
   if (!packageManager) reasons.push("missing standard package manager manifest");
-  if (!hasDockerfile) reasons.push("missing Dockerfile");
   if (!hasTests) reasons.push("tests not detected");
   if (!readmeEnglishLikely) reasons.push("README does not look English enough");
   if (!hasBuildHints) reasons.push("README lacks clear build or test hints");
