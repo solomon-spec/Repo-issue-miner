@@ -2,7 +2,14 @@ import type Database from "better-sqlite3";
 import { join, resolve } from "node:path";
 import { prepareSnapshot } from "./git.js";
 import { GitHubClient } from "./github.js";
-import { buildSetupPrompt, collectChangedFiles, isPathAllowedByPatterns, writeGitDiff } from "./setup.js";
+import {
+  buildSetupPrompt,
+  collectChangedFiles,
+  isPathAllowedByPatterns,
+  listSetupLockFiles,
+  removeSetupLockFiles,
+  writeGitDiff,
+} from "./setup.js";
 import { updateSetupRun } from "./db.js";
 import type { Config, SearchRepo, SetupProfile, SetupRunRecord, SetupRunStatus, SetupTargetType } from "./types.js";
 import { CommandAbortedError, ensureDir, readUtf8Safe, runCommand } from "./util.js";
@@ -96,6 +103,16 @@ export function appendSetupRunOutput(run: ActiveSetupRunState, stream: "stdout" 
   appendSetupRunOutputWithSource(run, "codex", stream, chunk);
 }
 
+function formatCommandDuration(durationMs: number): string {
+  if (!Number.isFinite(durationMs) || durationMs < 1000) {
+    return `${Math.max(0, Math.round(durationMs))}ms`;
+  }
+  if (durationMs < 60_000) {
+    return `${(durationMs / 1000).toFixed(1)}s`;
+  }
+  return `${(durationMs / 60_000).toFixed(1)}m`;
+}
+
 function appendSetupRunOutputWithSource(
   run: ActiveSetupRunState,
   source: string,
@@ -118,7 +135,10 @@ async function runSetupCommand(
   cwd: string,
   command: string,
   args: string[],
-): Promise<void> {
+): Promise<{ code: number | null; stdout: string; stderr: string; timedOut: boolean; aborted: boolean }> {
+  const startedAt = Date.now();
+  const commandLabel = [command, ...args].join(" ");
+  appendSetupRunLog(runState, `Running command: ${commandLabel}`);
   const result = await runCommand({
     cmd: command,
     args,
@@ -128,8 +148,23 @@ async function runSetupCommand(
     onStderrChunk: (chunk) => appendSetupRunOutputWithSource(runState, command, "stderr", chunk),
   });
   if (result.code !== 0) {
+    appendSetupRunLog(
+      runState,
+      `Command failed after ${formatCommandDuration(Date.now() - startedAt)}: ${commandLabel}${result.stderr || result.stdout ? ` — ${(result.stderr || result.stdout).trim().split(/\r?\n/g)[0]}` : ""}`,
+    );
     throw new Error(`${command} ${args.join(" ")} failed: ${result.stderr || result.stdout}`);
   }
+  appendSetupRunLog(runState, `Command passed after ${formatCommandDuration(Date.now() - startedAt)}: ${commandLabel}`);
+  return result;
+}
+
+function extractSkippedSetupReason(finalMessage: string | undefined): string | undefined {
+  if (!finalMessage) return undefined;
+  const trimmed = finalMessage.trim();
+  const match = trimmed.match(/^SKIP_SETUP:\s*(.+)$/is);
+  if (!match) return undefined;
+  const reason = match[1]?.trim();
+  return reason || undefined;
 }
 
 async function finalizeSetupCommit(runState: ActiveSetupRunState, worktreePath: string): Promise<string | undefined> {
@@ -142,6 +177,9 @@ async function finalizeSetupCommit(runState: ActiveSetupRunState, worktreePath: 
   await runSetupCommand(runState, worktreePath, "git", ["config", "core.fileMode", "false"]);
   await runSetupCommand(runState, worktreePath, "git", ["config", "user.name", "PR Writer"]);
   await runSetupCommand(runState, worktreePath, "git", ["config", "user.email", "prwriter@reveloexperts.com"]);
+
+  appendSetupRunLog(runState, "Capturing git status before staging");
+  await runSetupCommand(runState, worktreePath, "git", ["status", "--short"]);
 
   appendSetupRunLog(runState, "Staging setup changes");
   await runSetupCommand(runState, worktreePath, "git", ["add", "."]);
@@ -168,6 +206,13 @@ async function finalizeSetupCommit(runState: ActiveSetupRunState, worktreePath: 
   }
   const commitSha = revParse.stdout.trim();
   appendSetupRunLog(runState, `Created setup commit ${commitSha}`);
+
+  appendSetupRunLog(runState, "Capturing git log for the setup commit");
+  await runSetupCommand(runState, worktreePath, "git", ["log", "-1", "--stat", "--decorate"]);
+
+  appendSetupRunLog(runState, "Capturing git describe output");
+  await runSetupCommand(runState, worktreePath, "git", ["describe", "--tags", "--always"]);
+
   return commitSha || undefined;
 }
 
@@ -247,8 +292,19 @@ export async function runSetupTask(
 
     appendSetupRunLog(runState, "Configuring local git snapshot defaults");
     await runSetupCommand(runState, snapshot.rootDir, "git", ["config", "core.fileMode", "false"]);
+    appendSetupRunLog(runState, "Configuring global git fileMode defaults");
+    await runSetupCommand(runState, snapshot.rootDir, "git", ["config", "--global", "core.fileMode", "false"]);
 
-    const prompt = buildSetupPrompt(target.repo, snapshot, profile, target);
+    const discoveredLockFiles = listSetupLockFiles(snapshot.files);
+    let removedLockFiles: string[] = [];
+    if (discoveredLockFiles.length) {
+      appendSetupRunLog(runState, `Removing ${discoveredLockFiles.length} lock file(s) before setup editing`);
+      removedLockFiles = removeSetupLockFiles(snapshot.rootDir, discoveredLockFiles);
+    } else {
+      appendSetupRunLog(runState, "No lock files detected for automatic removal");
+    }
+
+    const prompt = buildSetupPrompt(target.repo, snapshot, profile, target, { removedLockFiles });
     const codexCommand = await resolveCodexExecutable(config, runState.abortController.signal);
     const args = ["exec", "--color", "never", "-C", snapshot.rootDir, "-o", lastMessagePath] as string[];
     if (profile.model) {
@@ -262,6 +318,7 @@ export async function runSetupTask(
     args.push(prompt);
 
     appendSetupRunLog(runState, `Running Codex via ${codexCommand}`);
+    const codexStartedAt = Date.now();
     const execution = await runCommand({
       cmd: codexCommand,
       args,
@@ -272,18 +329,20 @@ export async function runSetupTask(
       onStdoutChunk: (chunk) => appendSetupRunOutput(runState, "stdout", chunk),
       onStderrChunk: (chunk) => appendSetupRunOutput(runState, "stderr", chunk),
     });
+    appendSetupRunLog(runState, `Codex exited with code ${String(execution.code)} after ${formatCommandDuration(Date.now() - codexStartedAt)}`);
 
     runState.changedFiles = await collectChangedFiles(snapshot.rootDir);
     runState.violationFiles = runState.changedFiles.filter((file) => !isPathAllowedByPatterns(file, profile.writablePaths));
 
+    const finalMessage = readUtf8Safe(lastMessagePath)?.trim();
+    const skippedReason = execution.code === 0 ? extractSkippedSetupReason(finalMessage) : undefined;
     let commitSha: string | undefined;
-    if (execution.code === 0) {
+    if (execution.code === 0 && !skippedReason) {
       commitSha = await finalizeSetupCommit(runState, snapshot.rootDir);
     } else {
       await writeGitDiff(snapshot.rootDir, diffPath);
     }
 
-    const finalMessage = readUtf8Safe(lastMessagePath)?.trim();
     const summaryBits: string[] = [];
     if (finalMessage) {
       summaryBits.push(finalMessage);
@@ -295,8 +354,13 @@ export async function runSetupTask(
     if (runState.violationFiles.length) {
       summaryBits.push(`Changed files outside allowed write paths: ${runState.violationFiles.join(", ")}`);
     }
+    if (removedLockFiles.length) {
+      summaryBits.push(`Automatically removed lock files before setup: ${removedLockFiles.join(", ")}`);
+    }
     if (commitSha) {
       summaryBits.push(`Created setup commit: ${commitSha}`);
+    } else if (skippedReason) {
+      summaryBits.push(`Setup was skipped: ${skippedReason}`);
     } else if (execution.code === 0) {
       summaryBits.push("No setup changes were detected, so no setup commit was created.");
     }
@@ -307,6 +371,11 @@ export async function runSetupTask(
       runState.finishedAt = new Date().toISOString();
       runState.error = execution.stderr.trim() || execution.stdout.trim() || `codex exited with code ${String(execution.code)}`;
       appendSetupRunLog(runState, `Setup task failed: ${runState.error}`);
+    } else if (skippedReason) {
+      runState.status = "skipped";
+      runState.finishedAt = new Date().toISOString();
+      runState.error = undefined;
+      appendSetupRunLog(runState, `Setup task skipped: ${skippedReason}`);
     } else {
       runState.status = "completed";
       runState.finishedAt = new Date().toISOString();

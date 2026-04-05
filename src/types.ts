@@ -338,7 +338,7 @@ export interface CodexTaskState {
 }
 
 export type SetupSandboxMode = "workspace-write" | "danger-full-access";
-export type SetupRunStatus = "running" | "completed" | "failed" | "stopped";
+export type SetupRunStatus = "running" | "completed" | "failed" | "stopped" | "skipped";
 export type SetupTargetType = "repo" | "issue";
 
 export interface SetupProfile {

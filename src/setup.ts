@@ -1,3 +1,5 @@
+import { rmSync } from "node:fs";
+import { resolve } from "node:path";
 import { RepoSnapshot, SearchRepo, SetupProfile, SetupTargetType } from "./types.js";
 import { runCommand } from "./util.js";
 
@@ -11,6 +13,10 @@ type SetupPromptTarget = {
   pullRequestNumber?: number;
   pullRequestTitle?: string;
   pullRequestUrl?: string;
+};
+
+type SetupPromptContext = {
+  removedLockFiles?: string[];
 };
 
 function escapeRegExp(value: string): string {
@@ -91,21 +97,73 @@ export function isPathAllowedByPatterns(file: string, patterns: string[]): boole
   return patterns.some((pattern) => patternMatchesPath(pattern, file));
 }
 
+const EXTRA_LOCK_FILE_NAMES = new Set([
+  "package-lock.json",
+  "npm-shrinkwrap.json",
+  "pnpm-lock.yaml",
+  "yarn.lock",
+  "bun.lock",
+  "bun.lockb",
+  "pipfile.lock",
+  "poetry.lock",
+  "uv.lock",
+  "pdm.lock",
+  "cargo.lock",
+]);
+
+export function isSetupLockFile(file: string): boolean {
+  const normalized = normalizeRelativeSetupPath(file).toLowerCase();
+  const base = normalized.split("/").pop() || normalized;
+  return base.endsWith(".lock") || base.endsWith(".lockb") || EXTRA_LOCK_FILE_NAMES.has(base);
+}
+
+export function listSetupLockFiles(files: string[]): string[] {
+  return files
+    .filter((file) => {
+      try {
+        return isSetupLockFile(file);
+      } catch {
+        return false;
+      }
+    })
+    .sort((left, right) => left.localeCompare(right));
+}
+
+export function removeSetupLockFiles(worktreePath: string, files: string[]): string[] {
+  const removed: string[] = [];
+  for (const file of listSetupLockFiles(files)) {
+    rmSync(resolve(worktreePath, file), { force: true });
+    removed.push(file);
+  }
+  return removed;
+}
+
 export function buildSetupPrompt(
   repo: SearchRepo,
   snapshot: RepoSnapshot,
   profile: Pick<SetupProfile, "prompt" | "contextPaths" | "writablePaths" | "validationPrompt">,
   target: SetupPromptTarget,
+  context: SetupPromptContext = {},
 ): string {
-  const contextFiles = expandSetupPathPatterns(snapshot.files, profile.contextPaths).slice(0, 80);
-  const missingPatterns = profile.contextPaths.filter((pattern) => !contextFiles.some((file) => patternMatchesPath(pattern, file)));
+  const removedLockFiles = Array.isArray(context.removedLockFiles) ? context.removedLockFiles : [];
+  const removedSet = new Set(removedLockFiles);
+  const contextFiles = expandSetupPathPatterns(snapshot.files, profile.contextPaths)
+    .filter((file) => !removedSet.has(file))
+    .slice(0, 80);
+  const missingPatterns = profile.contextPaths.filter((pattern) => (
+    !contextFiles.some((file) => patternMatchesPath(pattern, file))
+    && !removedLockFiles.some((file) => patternMatchesPath(pattern, file))
+  ));
 
   const sections = [
     `You are working in a local checkout of the GitHub repository ${repo.fullName}.`,
     `The checkout is already positioned at commit ${snapshot.sha}.`,
     `Setup target: ${target.targetLabel}.`,
     "This is the setup phase only. Do not implement the issue itself.",
+    "The platform already configured git core.fileMode to false locally and globally.",
     "Do not create commits yourself. The platform will configure git author details and create the setup commit after validation.",
+    "Complete the numbered steps in order. Do not move to the next step until the current step is finished or clearly blocked.",
+    "If setup cannot be completed within the allowed files, stop early and begin the final summary with: SKIP_SETUP: <short reason>.",
     "",
     "Goal:",
     profile.prompt.trim(),
@@ -123,6 +181,12 @@ export function buildSetupPrompt(
   if (contextFiles.length) {
     sections.push("", "Read these files first before making changes:");
     sections.push(...contextFiles.map((file) => `- ${file}`));
+  }
+
+  if (removedLockFiles.length) {
+    sections.push("", "The platform already scanned and removed these lock files before your editing steps:");
+    sections.push(...removedLockFiles.map((file) => `- ${file}`));
+    sections.push("Do not recreate those lock files.");
   }
 
   if (missingPatterns.length) {

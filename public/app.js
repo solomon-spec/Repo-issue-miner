@@ -23,7 +23,7 @@
   }
 
   function badgeClassForStatus(status) {
-    return { running: "badge-running", completed: "badge-completed", failed: "badge-failed", stopped: "badge-warn" }[status] || "badge-warn";
+    return { running: "badge-running", completed: "badge-completed", failed: "badge-failed", stopped: "badge-warn", skipped: "badge-info" }[status] || "badge-warn";
   }
 
   function statusBadge(status) {
@@ -201,6 +201,11 @@
     runId: null,
     scrollTop: 0,
     autoFollow: true,
+  };
+  let activeSetupRunDetail = null;
+  let setupRunDetailState = {
+    runId: null,
+    tab: "overview",
   };
 
   function switchPage(page) {
@@ -802,6 +807,306 @@
     return items.map((item) => `<span class="setup-chip ${modifier}">${esc(item)}</span>`).join("");
   }
 
+  function parseSetupLogEntries(logs) {
+    if (!Array.isArray(logs)) return [];
+    return logs
+      .map((line) => {
+        const text = String(line || "");
+        const match = text.match(/^\[([^\]]+)\]\s*(.*)$/);
+        if (!match) return null;
+        return { raw: text, at: match[1], message: match[2] || "" };
+      })
+      .filter(Boolean);
+  }
+
+  function classifySetupEventTone(message, fallbackStatus = "") {
+    const text = String(message || "").toLowerCase();
+    if (/failed|error|out-of-scope/.test(text)) return "failed";
+    if (/skip_setup|skipped|blocked/.test(text)) return "info";
+    if (/stopped/.test(text)) return "warn";
+    if (/completed|passed|created setup commit/.test(text)) return "completed";
+    if (/running|preparing|configuring|removing|staging|creating/.test(text)) return "running";
+    return fallbackStatus || "info";
+  }
+
+  function extractSetupCommands(entries) {
+    const commands = [];
+    let codexCommand = null;
+
+    entries.forEach((entry) => {
+      const message = entry.message || "";
+      if (message.startsWith("Running command: ")) {
+        commands.push({
+          command: message.slice("Running command: ".length),
+          status: "running",
+          startedAt: entry.at,
+          finishedAt: null,
+          durationText: "",
+          source: "shell",
+        });
+        return;
+      }
+
+      let match = message.match(/^Command passed after (.+?): (.+)$/);
+      if (match) {
+        const pending = [...commands].reverse().find((item) => item.command === match[2] && item.status === "running");
+        if (pending) {
+          pending.status = "completed";
+          pending.finishedAt = entry.at;
+          pending.durationText = match[1];
+        } else {
+          commands.push({
+            command: match[2],
+            status: "completed",
+            startedAt: null,
+            finishedAt: entry.at,
+            durationText: match[1],
+            source: "shell",
+          });
+        }
+        return;
+      }
+
+      match = message.match(/^Command failed after (.+?): (.+?)(?: — .+)?$/);
+      if (match) {
+        const pending = [...commands].reverse().find((item) => item.command === match[2] && item.status === "running");
+        if (pending) {
+          pending.status = "failed";
+          pending.finishedAt = entry.at;
+          pending.durationText = match[1];
+        } else {
+          commands.push({
+            command: match[2],
+            status: "failed",
+            startedAt: null,
+            finishedAt: entry.at,
+            durationText: match[1],
+            source: "shell",
+          });
+        }
+        return;
+      }
+
+      if (message.startsWith("Running Codex via ")) {
+        codexCommand = {
+          command: "codex exec",
+          status: "running",
+          startedAt: entry.at,
+          finishedAt: null,
+          durationText: "",
+          source: "codex",
+          detail: message.slice("Running Codex via ".length),
+        };
+        commands.push(codexCommand);
+        return;
+      }
+
+      match = message.match(/^Codex exited with code (\S+) after (.+)$/);
+      if (match && codexCommand) {
+        codexCommand.status = match[1] === "0" ? "completed" : "failed";
+        codexCommand.finishedAt = entry.at;
+        codexCommand.durationText = match[2];
+      }
+    });
+
+    return commands;
+  }
+
+  function buildSetupTimeline(run, entries) {
+    const items = [{
+      title: "Run started",
+      detail: run.targetLabel || run.repoFullName,
+      at: run.startedAt,
+      tone: "running",
+    }];
+
+    const filtered = entries.filter((entry) => {
+      const message = entry.message || "";
+      return !/^Running command: /.test(message)
+        && !/^Command passed after /.test(message)
+        && !/^Command failed after /.test(message);
+    });
+
+    filtered.forEach((entry) => {
+      items.push({
+        title: entry.message,
+        detail: "",
+        at: entry.at,
+        tone: classifySetupEventTone(entry.message),
+      });
+    });
+
+    if (!filtered.length && run.stage) {
+      items.push({
+        title: run.stage,
+        detail: "",
+        at: run.finishedAt || run.startedAt,
+        tone: classifySetupEventTone(run.stage, run.status),
+      });
+    }
+
+    if (run.finishedAt) {
+      items.push({
+        title: run.status === "completed"
+          ? "Run completed"
+          : run.status === "failed"
+            ? "Run failed"
+            : run.status === "skipped"
+              ? "Run skipped"
+              : "Run stopped",
+        detail: run.error || "",
+        at: run.finishedAt,
+        tone: classifySetupEventTone(run.status, run.status),
+      });
+    }
+
+    return items.slice(-12);
+  }
+
+  function extractImportantSetupLines(run, consoleOutput) {
+    const important = [];
+    const seen = new Set();
+    const lines = [
+      ...(String(run.lastMessage || "").split(/\r?\n/g)),
+      ...(String(run.summary || "").split(/\r?\n/g)),
+      ...(String(consoleOutput || "").split(/\r?\n/g)),
+    ];
+    for (const rawLine of lines) {
+      const line = rawLine.trim();
+      if (!line) continue;
+      if (!/error|failed|warn|warning|skip_setup|blocked|docker build|docker run|pip freeze|pytest|test|typecheck|remaining blocker|removed lock files|created setup commit|out-of-scope/i.test(line)) {
+        continue;
+      }
+      if (seen.has(line)) continue;
+      seen.add(line);
+      important.push(line);
+      if (important.length >= 16) break;
+    }
+    if (!important.length) {
+      return String(consoleOutput || "").split(/\r?\n/g).map((line) => line.trim()).filter(Boolean).slice(-12);
+    }
+    return important;
+  }
+
+  function buildSetupOverviewMetrics(run, entries, commands) {
+    const startedAtMs = run.startedAt ? new Date(run.startedAt).getTime() : NaN;
+    const finishedAtMs = run.finishedAt ? new Date(run.finishedAt).getTime() : Date.now();
+    const elapsedMs = Number.isFinite(startedAtMs) ? Math.max(0, finishedAtMs - startedAtMs) : null;
+    const lastEntry = entries.at(-1);
+    return [
+      {
+        label: "Current Step",
+        value: run.status === "running" ? (run.stage || "Running setup") : (run.status || "—"),
+        tone: run.status === "failed" ? "failed" : run.status === "completed" ? "completed" : run.status === "skipped" ? "info" : "running",
+      },
+      {
+        label: "Elapsed",
+        value: elapsedMs === null ? "—" : fmtDuration(elapsedMs),
+        tone: "info",
+      },
+      {
+        label: "Commands",
+        value: String(commands.length),
+        tone: "info",
+      },
+      {
+        label: "Files Changed",
+        value: String(Array.isArray(run.changedFiles) ? run.changedFiles.length : 0),
+        tone: Array.isArray(run.violationFiles) && run.violationFiles.length ? "failed" : "completed",
+      },
+      {
+        label: "Out-of-Scope Edits",
+        value: String(Array.isArray(run.violationFiles) ? run.violationFiles.length : 0),
+        tone: Array.isArray(run.violationFiles) && run.violationFiles.length ? "failed" : "completed",
+      },
+      {
+        label: "Last Update",
+        value: lastEntry?.message || run.lastMessage || run.summary || "No summary yet",
+        tone: classifySetupEventTone(lastEntry?.message || run.status, run.status),
+      },
+    ];
+  }
+
+  function renderSetupMetricCards(metrics) {
+    return `
+      <div class="setup-metric-grid">
+        ${metrics.map((metric) => `
+          <div class="setup-metric-card setup-metric-${esc(metric.tone || "info")}">
+            <span class="setup-metric-label">${esc(metric.label)}</span>
+            <strong class="setup-metric-value">${esc(metric.value || "—")}</strong>
+          </div>
+        `).join("")}
+      </div>
+    `;
+  }
+
+  function renderSetupTimeline(items) {
+    if (!items.length) {
+      return `<div class="empty-state compact-empty"><p>No timeline events captured yet.</p></div>`;
+    }
+    return `
+      <div class="setup-timeline">
+        ${items.map((item) => `
+          <div class="setup-timeline-item">
+            <span class="setup-timeline-dot tone-${esc(item.tone || "info")}"></span>
+            <div class="setup-timeline-body">
+              <div class="setup-timeline-heading">
+                <strong>${esc(item.title || "Update")}</strong>
+                <span>${esc(item.at ? fmtDate(item.at) : "—")}</span>
+              </div>
+              ${item.detail ? `<p>${esc(item.detail)}</p>` : ""}
+            </div>
+          </div>
+        `).join("")}
+      </div>
+    `;
+  }
+
+  function renderSetupCommands(commands) {
+    if (!commands.length) {
+      return `<div class="empty-state compact-empty"><p>No structured command events captured yet.</p></div>`;
+    }
+    return `
+      <div class="setup-command-list">
+        ${commands.map((command) => `
+          <div class="setup-command-row">
+            <div class="setup-command-main">
+              <code>${esc(command.command)}</code>
+              ${command.detail ? `<span class="setup-command-detail">${esc(command.detail)}</span>` : ""}
+            </div>
+            <div class="setup-command-meta">
+              ${statusBadge(command.status || "running")}
+              <span>${esc(command.durationText || "—")}</span>
+            </div>
+          </div>
+        `).join("")}
+      </div>
+    `;
+  }
+
+  function renderSetupDetailTabs(activeTab) {
+    const tabs = [
+      ["overview", "Overview"],
+      ["commands", "Commands"],
+      ["files", "Files"],
+      ["diff", "Diff"],
+      ["terminal", "Raw Terminal"],
+    ];
+    return `
+      <div class="setup-detail-tabs" role="tablist" aria-label="Setup run details">
+        ${tabs.map(([id, label]) => `
+          <button
+            type="button"
+            class="setup-detail-tab ${activeTab === id ? "active" : ""}"
+            data-setup-detail-tab="${esc(id)}"
+            role="tab"
+            aria-selected="${activeTab === id ? "true" : "false"}"
+          >${esc(label)}</button>
+        `).join("")}
+      </div>
+    `;
+  }
+
   function renderSetupRunsTable(runs) {
     const tbody = $("#setup-runs-tbody");
     if (!tbody) return;
@@ -855,6 +1160,7 @@
     const container = $("#setup-run-detail");
     const stopButton = $("#setup-stop-run");
     if (!container || !stopButton) return;
+    activeSetupRunDetail = run || null;
 
     const existingTerminalOutput = $("[data-setup-terminal-output]", container);
     if (existingTerminalOutput && setupRunTerminalState.runId === selectedSetupRunId) {
@@ -873,14 +1179,79 @@
         scrollTop: 0,
         autoFollow: true,
       };
+      setupRunDetailState = {
+        runId: null,
+        tab: "overview",
+      };
       container.innerHTML = `<div class="empty-state"><div class="empty-icon">🧪</div><p>Select a setup run to inspect its prompt, output, changed files, and diff.</p></div>`;
       return;
+    }
+
+    if (setupRunDetailState.runId !== run.id) {
+      setupRunDetailState = {
+        runId: run.id,
+        tab: "overview",
+      };
     }
 
     stopButton.disabled = run.status !== "running";
     stopButton.dataset.runId = String(run.id);
     const consoleOutput = run.liveOutput || run.stdoutExcerpt || run.stderrExcerpt || run.lastMessage || "No terminal output captured yet.";
     const worktreePath = run.worktreePath || "Not recorded yet";
+    const entries = parseSetupLogEntries(run.logs || []);
+    const commands = extractSetupCommands(entries);
+    const timeline = buildSetupTimeline(run, entries);
+    const importantLines = extractImportantSetupLines(run, consoleOutput);
+    const metrics = buildSetupOverviewMetrics(run, entries, commands);
+    const activeTab = setupRunDetailState.tab || "overview";
+    const detailPanels = {
+      overview: `
+        <div class="setup-detail-section">
+          <span class="setup-detail-label">Run Overview</span>
+          ${renderSetupMetricCards(metrics)}
+          <div class="setup-two-column">
+            <div class="setup-detail-section nested">
+              <span class="setup-detail-label">Timeline</span>
+              ${renderSetupTimeline(timeline)}
+            </div>
+            <div class="setup-detail-section nested">
+              <span class="setup-detail-label">Important Updates</span>
+              <pre class="log-output log-output-compact">${esc(importantLines.join("\n") || "No important updates captured yet.")}</pre>
+            </div>
+          </div>
+        </div>
+      `,
+      commands: `
+        <div class="setup-detail-section">
+          <span class="setup-detail-label">Commands</span>
+          <p class="form-helper">Structured command tracking is easier to scan than the raw terminal. Running and failed commands surface here first.</p>
+          ${renderSetupCommands(commands)}
+        </div>
+      `,
+      files: `
+        <div class="setup-detail-section">
+          <span class="setup-detail-label">Files Changed</span>
+          <div class="setup-chip-list">${renderSetupChipList(run.changedFiles, "No changed files recorded")}</div>
+          <span class="setup-detail-label setup-detail-subsection">Out-of-Scope Edits</span>
+          <div class="setup-chip-list">${renderSetupChipList(run.violationFiles, "No out-of-scope file edits", "danger")}</div>
+          <span class="setup-detail-label setup-detail-subsection">Final Message</span>
+          <pre class="log-output log-output-compact">${esc(run.lastMessage || "No final message captured yet.")}</pre>
+        </div>
+      `,
+      diff: `
+        <div class="setup-detail-section">
+          <span class="setup-detail-label">Diff</span>
+          <pre class="log-output log-output-compact">${esc(run.diffExcerpt || "No diff captured yet.")}</pre>
+        </div>
+      `,
+      terminal: `
+        <div class="setup-detail-section">
+          <span class="setup-detail-label">Raw Terminal Output</span>
+          <p class="form-helper">This is the full raw stream from Codex and the setup commands. Use it for deep debugging after checking Overview and Commands first.</p>
+          <pre class="log-output" data-setup-terminal-output="1">${esc(consoleOutput)}</pre>
+        </div>
+      `,
+    };
 
     container.innerHTML = `
       <div class="setup-detail-grid">
@@ -901,8 +1272,7 @@
             <dt>Worktree</dt><dd><code>${esc(worktreePath)}</code></dd>
           </dl>
           <p class="setup-summary-text">${esc(run.summary || run.error || "No summary available yet.")}</p>
-          <div class="setup-chip-list">${renderSetupChipList(run.changedFiles, "No changed files recorded")}</div>
-          <div class="setup-chip-list">${renderSetupChipList(run.violationFiles, "No out-of-scope file edits", "danger")}</div>
+          ${renderSetupMetricCards(metrics.slice(0, 3))}
         </div>
         <div class="setup-detail-prompt">
           <strong>Configured Scope</strong>
@@ -926,20 +1296,20 @@
         </div>
       </div>
       <div class="setup-output-stack">
-        <div class="setup-detail-section">
-          <span class="setup-detail-label">Terminal Output</span>
-          <pre class="log-output" data-setup-terminal-output="1">${esc(consoleOutput)}</pre>
-        </div>
-        <div class="setup-detail-section">
-          <span class="setup-detail-label">Final Message</span>
-          <pre class="log-output log-output-compact">${esc(run.lastMessage || "No final message captured yet.")}</pre>
-        </div>
-        <div class="setup-detail-section">
-          <span class="setup-detail-label">Diff</span>
-          <pre class="log-output log-output-compact">${esc(run.diffExcerpt || "No diff captured yet.")}</pre>
-        </div>
+        ${renderSetupDetailTabs(activeTab)}
+        ${detailPanels[activeTab] || detailPanels.overview}
       </div>
     `;
+
+    $$("[data-setup-detail-tab]", container).forEach((button) => {
+      button.addEventListener("click", () => {
+        setupRunDetailState = {
+          runId: run.id,
+          tab: button.dataset.setupDetailTab || "overview",
+        };
+        renderSetupRunDetail(activeSetupRunDetail);
+      });
+    });
 
     const terminalOutput = $("[data-setup-terminal-output]", container);
     if (terminalOutput) {

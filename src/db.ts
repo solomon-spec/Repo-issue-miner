@@ -474,7 +474,7 @@ function mapSetupRunRow(row: any): SetupRunRecord {
     issueTitle: typeof row.issue_title === "string" && row.issue_title ? row.issue_title : undefined,
     profileId: typeof row.profile_id === "number" ? row.profile_id : undefined,
     profileName: typeof row.profile_name === "string" && row.profile_name ? row.profile_name : undefined,
-    status: row.status === "completed" || row.status === "failed" || row.status === "stopped" ? row.status : "running",
+    status: row.status === "completed" || row.status === "failed" || row.status === "stopped" || row.status === "skipped" ? row.status : "running",
     prompt: String(row.prompt),
     contextPaths: parseJsonList(row.context_paths_json),
     writablePaths: parseJsonList(row.writable_paths_json),
