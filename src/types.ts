@@ -160,6 +160,26 @@ export interface ExecutionResult {
   notes: string[];
 }
 
+export type GeminiIssueAcceptanceStatus = "accepted_by_gemini" | "not_accepted_by_gemini";
+
+export interface GeminiIssueAcceptanceReview {
+  owner: string;
+  repo: string;
+  number: number;
+  issueKey: string;
+  title?: string;
+  status: GeminiIssueAcceptanceStatus;
+  kind: "bug_fix" | "feature" | "too_trivial" | "not_bug_or_feature" | "unclear";
+  reasoning: string;
+}
+
+export interface GeminiAcceptedPrReview {
+  status: "accepted_by_gemini" | "not_accepted_by_gemini" | "mixed";
+  summary: string;
+  analyzedAt: string;
+  issues: GeminiIssueAcceptanceReview[];
+}
+
 export interface StepTiming {
   step: string;
   startedAt: string;

@@ -10,6 +10,9 @@ import {
   buildPromptOne,
   buildTmuxSessionInfo,
   parseCodexReviewOutput,
+  parsePromptOneRewriteOutput,
+  reopenLastCodexTaskRound,
+  updateCodexTaskSettings,
   writeReviewBundle,
 } from "../dist/codex-task.js";
 
@@ -23,10 +26,181 @@ test("buildPromptOne preserves issue facts while turning it into a prompt", () =
     selectedFromCount: 1,
   });
 
-  assert.match(prompt, /Address the following GitHub issue/i);
+  assert.match(prompt, /current repository/i);
   assert.match(prompt, /Managed Identity token refresh fails on regional endpoints/);
   assert.match(prompt, /Managed Identity in Azure/);
+  assert.match(prompt, /Preserve the original constraints/i);
+  assert.doesNotMatch(prompt, /Issue title:/i);
   assert.doesNotMatch(prompt, /consent cookies/i);
+});
+
+test("parsePromptOneRewriteOutput extracts the rewritten prompt from Codex JSON", () => {
+  const prompt = parsePromptOneRewriteOutput(`\`\`\`json
+{"prompt":"Investigate the Managed Identity refresh flow and fix the regional endpoint failure without expanding the scope."}
+\`\`\``);
+
+  assert.match(prompt, /Investigate the Managed Identity refresh flow/i);
+  assert.doesNotMatch(prompt, /^```/);
+});
+
+test("parsePromptOneRewriteOutput rejects the legacy issue-copy format", () => {
+  assert.throws(
+    () => parsePromptOneRewriteOutput(JSON.stringify({
+      prompt: "Address the following GitHub issue in the current repository.\n\nIssue title: Fix rate limiting\n\nIssue description:\n\nThe plugin is rate limited.",
+    })),
+    /legacy issue-copy format/i,
+  );
+});
+
+test("reopenLastCodexTaskRound rewinds to the latest reviewed round and drops stale next prompts", () => {
+  const reopened = reopenLastCodexTaskRound({
+    hfiUuid: "abc-123",
+    originalRepoPath: "/repo",
+    worktreeAPath: "/repo-a",
+    worktreeBPath: "/repo-b",
+    currentRound: 3,
+    maxPrompts: 4,
+    startedAt: "2026-04-06T00:00:00.000Z",
+    updatedAt: "2026-04-06T00:00:00.000Z",
+    issue: {
+      title: "Fix retry loop",
+      selectedFromCount: 1,
+    },
+    prompts: [
+      { round: 1, prompt: "Prompt 1", source: "issue_rewrite", generatedAt: "2026-04-06T00:00:00.000Z" },
+      { round: 2, prompt: "Prompt 2", source: "review_follow_up", generatedAt: "2026-04-06T00:00:01.000Z" },
+      { round: 3, prompt: "Prompt 3", source: "review_follow_up", generatedAt: "2026-04-06T00:00:02.000Z" },
+    ],
+    rounds: [
+      {
+        round: 1,
+        notesA: "round1 A",
+        notesB: "round1 B",
+        reviewDraft: {
+          winner: "A",
+          modelA: { pros: "ok", cons: "minor" },
+          modelB: { pros: "ok", cons: "minor" },
+          axes: {
+            preferred_output: "a",
+            logic_and_correctness: "a",
+            naming_and_clarity: "a",
+            organization_and_modularity: "a",
+            interface_design: "a",
+            error_handling: "a",
+            comments_and_documentation: "a",
+            review_and_production_readiness: "a",
+          },
+          overallJustification: "A wins",
+          winnerUnresolvedCons: ["none"],
+          nextPrompt: "Prompt 2",
+          confidenceNotes: "high",
+          generatedAt: "2026-04-06T00:00:01.000Z",
+        },
+      },
+      {
+        round: 2,
+        notesA: "round2 A",
+        notesB: "round2 B",
+        reviewDraft: {
+          winner: "B",
+          modelA: { pros: "ok", cons: "minor" },
+          modelB: { pros: "ok", cons: "minor" },
+          axes: {
+            preferred_output: "b",
+            logic_and_correctness: "b",
+            naming_and_clarity: "b",
+            organization_and_modularity: "b",
+            interface_design: "b",
+            error_handling: "b",
+            comments_and_documentation: "b",
+            review_and_production_readiness: "b",
+          },
+          overallJustification: "B wins",
+          winnerUnresolvedCons: ["add tests"],
+          nextPrompt: "Prompt 3",
+          confidenceNotes: "medium",
+          generatedAt: "2026-04-06T00:00:02.000Z",
+        },
+        artifactDir: "/tmp/review-2",
+        generatedAt: "2026-04-06T00:00:02.000Z",
+        promptGeneratedForNextRound: 3,
+      },
+    ],
+  });
+
+  assert.equal(reopened.currentRound, 2);
+  assert.deepEqual(reopened.prompts.map((item) => item.round), [1, 2]);
+  assert.equal(reopened.rounds.length, 2);
+  assert.equal(reopened.rounds[1].round, 2);
+  assert.equal(reopened.rounds[1].notesA, "round2 A");
+  assert.equal(reopened.rounds[1].reviewDraft, undefined);
+});
+
+test("reopenLastCodexTaskRound rejects tasks with no completed rounds", () => {
+  assert.throws(
+    () => reopenLastCodexTaskRound({
+      hfiUuid: "abc-123",
+      originalRepoPath: "/repo",
+      worktreeAPath: "/repo-a",
+      worktreeBPath: "/repo-b",
+      currentRound: 1,
+      maxPrompts: 4,
+      startedAt: "2026-04-06T00:00:00.000Z",
+      updatedAt: "2026-04-06T00:00:00.000Z",
+      issue: {
+        title: "Fix retry loop",
+        selectedFromCount: 1,
+      },
+      prompts: [
+        { round: 1, prompt: "Prompt 1", source: "issue_rewrite", generatedAt: "2026-04-06T00:00:00.000Z" },
+      ],
+      rounds: [],
+    }),
+    /no completed round is available to reopen/i,
+  );
+});
+
+test("updateCodexTaskSettings changes UUID and paths without resetting task history", () => {
+  const updated = updateCodexTaskSettings({
+    hfiUuid: "old-uuid",
+    originalRepoPath: "/repo-old",
+    worktreeAPath: "/repo-old-a",
+    worktreeBPath: "/repo-old-b",
+    testCommand: "npm test",
+    currentRound: 3,
+    maxPrompts: 4,
+    startedAt: "2026-04-06T00:00:00.000Z",
+    updatedAt: "2026-04-06T00:00:01.000Z",
+    issue: {
+      title: "Fix retry loop",
+      selectedFromCount: 1,
+    },
+    prompts: [
+      { round: 1, prompt: "Prompt 1", source: "issue_rewrite", generatedAt: "2026-04-06T00:00:00.000Z" },
+      { round: 2, prompt: "Prompt 2", source: "review_follow_up", generatedAt: "2026-04-06T00:00:01.000Z" },
+      { round: 3, prompt: "Prompt 3", source: "review_follow_up", generatedAt: "2026-04-06T00:00:02.000Z" },
+    ],
+    rounds: [
+      { round: 1, notesA: "A1", notesB: "B1" },
+      { round: 2, notesA: "A2", notesB: "B2" },
+    ],
+  }, {
+    hfiUuid: "new-uuid",
+    originalRepoPath: "/repo-new",
+    worktreeAPath: "/repo-new-a",
+    worktreeBPath: "/repo-new-b",
+    testCommand: "pnpm test",
+  });
+
+  assert.equal(updated.hfiUuid, "new-uuid");
+  assert.equal(updated.originalRepoPath, "/repo-new");
+  assert.equal(updated.worktreeAPath, "/repo-new-a");
+  assert.equal(updated.worktreeBPath, "/repo-new-b");
+  assert.equal(updated.testCommand, "pnpm test");
+  assert.equal(updated.currentRound, 3);
+  assert.equal(updated.startedAt, "2026-04-06T00:00:00.000Z");
+  assert.deepEqual(updated.prompts.map((item) => item.round), [1, 2, 3]);
+  assert.deepEqual(updated.rounds.map((item) => item.round), [1, 2]);
 });
 
 test("buildFollowUpPrompt addresses unresolved cons without widening scope", () => {

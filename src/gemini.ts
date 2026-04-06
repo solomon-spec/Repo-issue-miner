@@ -1,6 +1,12 @@
 import { readFileSync } from "node:fs";
 import { join, relative } from "node:path";
-import { Config, RepoSnapshot, TestPlan } from "./types.js";
+import {
+  Config,
+  GeminiAcceptedPrReview,
+  GeminiIssueAcceptanceReview,
+  RepoSnapshot,
+  TestPlan,
+} from "./types.js";
 import { fileExists, readUtf8Safe, stripMarkdownFence, withTimeoutSignal } from "./util.js";
 
 const SAFE_COMMANDS = new Set([
@@ -46,6 +52,28 @@ const CANDIDATE_FILES = [
 export interface DockerfileSuggestion {
   dockerfileContent: string;
   reasoningSummary: string;
+}
+
+export interface GeminiAcceptedPrReviewInput {
+  repoFullName: string;
+  pullRequest: {
+    number?: number;
+    title?: string;
+    body?: string;
+    mergedAt?: string | null;
+    changedFilesCount?: number;
+  };
+  relevantSourceFilesCount?: number;
+  relevantTestFilesCount?: number;
+  relevantCodeLinesChanged?: number;
+  issues: Array<{
+    owner: string;
+    repo: string;
+    number: number;
+    title?: string;
+    body?: string;
+    state?: string;
+  }>;
 }
 
 function clampText(value: string, maxBytes = 24_000): string {
@@ -322,6 +350,120 @@ async function generateGeminiStructured<T>(config: Config, prompt: string, schem
   } catch {
     return undefined;
   }
+}
+
+export async function analyzeAcceptedPullRequestWithGemini(
+  config: Config,
+  input: GeminiAcceptedPrReviewInput,
+): Promise<GeminiAcceptedPrReview | undefined> {
+  if (!config.geminiApiKey || !input.issues.length) {
+    return undefined;
+  }
+
+  const schema = {
+    type: "object",
+    properties: {
+      status: { type: "string", enum: ["accepted_by_gemini", "not_accepted_by_gemini", "mixed"] },
+      summary: { type: "string" },
+      issues: {
+        type: "array",
+        items: {
+          type: "object",
+          properties: {
+            owner: { type: "string" },
+            repo: { type: "string" },
+            number: { type: "number" },
+            issueKey: { type: "string" },
+            title: { type: "string" },
+            status: { type: "string", enum: ["accepted_by_gemini", "not_accepted_by_gemini"] },
+            kind: { type: "string", enum: ["bug_fix", "feature", "too_trivial", "not_bug_or_feature", "unclear"] },
+            reasoning: { type: "string" },
+          },
+          required: ["owner", "repo", "number", "issueKey", "status", "kind", "reasoning"],
+        },
+      },
+    },
+    required: ["status", "summary", "issues"],
+  };
+
+  const issueBlocks = input.issues.map((issue) => [
+    `ISSUE: ${issue.owner}/${issue.repo}#${issue.number}`,
+    issue.title ? `Title: ${issue.title}` : "",
+    issue.state ? `State: ${issue.state}` : "",
+    `Body:\n${clampText(issue.body || "No issue body provided.", 8_000)}`,
+  ].filter(Boolean).join("\n")).join("\n\n---\n\n");
+
+  const prompt = [
+    "You are reviewing whether each linked issue in an accepted pull request is substantial enough to stay accepted.",
+    "Classify each linked issue independently.",
+    "Mark status='accepted_by_gemini' only when the issue clearly describes a real bug fix or a real feature and the work appears meaningfully complex or non-trivial.",
+    "Mark status='not_accepted_by_gemini' when the issue is too trivial, mostly docs/chore/cleanup, unclear, or not really a bug fix / feature request.",
+    "Use kind='bug_fix' or kind='feature' only for genuinely accepted issues. Use kind='too_trivial', 'not_bug_or_feature', or 'unclear' when rejecting.",
+    "Return concise reasoning grounded in the issue text and PR context.",
+    "Return only JSON that matches the schema.",
+    "",
+    `Repository: ${input.repoFullName}`,
+    `Pull Request: #${input.pullRequest.number ?? "?"} ${input.pullRequest.title ?? ""}`.trim(),
+    `Merged At: ${input.pullRequest.mergedAt ?? "unknown"}`,
+    `Changed Files Count: ${input.pullRequest.changedFilesCount ?? "unknown"}`,
+    `Relevant Source Files Changed: ${input.relevantSourceFilesCount ?? 0}`,
+    `Relevant Test Files Changed: ${input.relevantTestFilesCount ?? 0}`,
+    `Relevant Code Lines Changed: ${input.relevantCodeLinesChanged ?? 0}`,
+    "",
+    `PR Body:\n${clampText(input.pullRequest.body || "No pull request body provided.", 10_000)}`,
+    "",
+    "Linked issues follow.",
+    issueBlocks,
+  ].join("\n");
+
+  const review = await generateGeminiStructured<Omit<GeminiAcceptedPrReview, "analyzedAt">>(config, prompt, schema);
+  if (!review) {
+    return undefined;
+  }
+
+  const fallbackIssues = new Map<string, GeminiIssueAcceptanceReview>();
+  for (const issue of input.issues) {
+    const issueKey = `${issue.owner}/${issue.repo}#${issue.number}`;
+    fallbackIssues.set(issueKey, {
+      owner: issue.owner,
+      repo: issue.repo,
+      number: issue.number,
+      issueKey,
+      title: issue.title,
+      status: "not_accepted_by_gemini",
+      kind: "unclear",
+      reasoning: "Gemini did not return a review for this linked issue.",
+    });
+  }
+
+  const issues = Array.isArray(review.issues)
+    ? review.issues.map((issue) => ({
+      ...fallbackIssues.get(issue.issueKey),
+      ...issue,
+    }))
+    : [];
+  const mergedIssues = input.issues.map((issue) => {
+    const issueKey = `${issue.owner}/${issue.repo}#${issue.number}`;
+    const fallback = fallbackIssues.get(issueKey);
+    const parsed = issues.find((item) => item.issueKey === issueKey);
+    return {
+      owner: issue.owner,
+      repo: issue.repo,
+      number: issue.number,
+      issueKey,
+      title: issue.title,
+      status: parsed?.status ?? fallback?.status ?? "not_accepted_by_gemini",
+      kind: parsed?.kind ?? fallback?.kind ?? "unclear",
+      reasoning: parsed?.reasoning ?? fallback?.reasoning ?? "Gemini did not return a review for this linked issue.",
+    } satisfies GeminiIssueAcceptanceReview;
+  });
+
+  return {
+    status: review.status,
+    summary: review.summary,
+    analyzedAt: new Date().toISOString(),
+    issues: mergedIssues,
+  };
 }
 
 export async function resolveTestPlan(config: Config, snapshot: RepoSnapshot, preferredDockerfilePath?: string): Promise<TestPlan | undefined> {

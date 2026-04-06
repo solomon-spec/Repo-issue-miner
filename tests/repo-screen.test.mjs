@@ -57,3 +57,20 @@ test("screenRepository reports missing requirements and archived repos clearly",
   assert.match(result.reasons.join(" | "), /README does not look English enough/i);
   assert.match(result.reasons.join(" | "), /README lacks clear build or test hints/i);
 });
+
+test("screenRepository rejects repos that only have colocated test files without a test directory", () => {
+  const result = screenRepository(
+    repo(),
+    [
+      { path: "package.json", type: "blob" },
+      { path: "src/index.ts", type: "blob" },
+      { path: "src/index.test.ts", type: "blob" },
+      { path: "README.md", type: "blob" },
+    ],
+    "Install dependencies with npm install, run tests with npm test, and run Docker builds from the project root.",
+  );
+
+  assert.equal(result.accepted, false);
+  assert.equal(result.hasTests, false);
+  assert.match(result.reasons.join(" | "), /tests not detected/i);
+});

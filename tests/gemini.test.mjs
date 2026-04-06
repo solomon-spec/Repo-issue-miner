@@ -5,6 +5,7 @@ import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 
 import {
+  analyzeAcceptedPullRequestWithGemini,
   describePlan,
   detectComposeBuild,
   localPath,
@@ -143,5 +144,96 @@ test("localPath and relativeWorkdir resolve within the snapshot root", () => {
     assert.equal(relativeWorkdir(snapshot, "."), snapshot.rootDir);
   } finally {
     cleanup();
+  }
+});
+
+test("analyzeAcceptedPullRequestWithGemini returns per-issue Gemini decisions", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => ({
+    ok: true,
+    async json() {
+      return {
+        candidates: [
+          {
+            content: {
+              parts: [
+                {
+                  text: JSON.stringify({
+                    status: "mixed",
+                    summary: "One issue is substantial and one is too small.",
+                    issues: [
+                      {
+                        owner: "example",
+                        repo: "repo",
+                        number: 12,
+                        issueKey: "example/repo#12",
+                        title: "Fix broken API pagination",
+                        status: "accepted_by_gemini",
+                        kind: "bug_fix",
+                        reasoning: "The issue describes a real regression and the PR appears meaningfully scoped.",
+                      },
+                      {
+                        owner: "example",
+                        repo: "repo",
+                        number: 13,
+                        issueKey: "example/repo#13",
+                        title: "Rename a label",
+                        status: "not_accepted_by_gemini",
+                        kind: "too_trivial",
+                        reasoning: "This is a small cosmetic change rather than a substantial bug fix or feature.",
+                      },
+                    ],
+                  }),
+                },
+              ],
+            },
+          },
+        ],
+      };
+    },
+  });
+
+  try {
+    const review = await analyzeAcceptedPullRequestWithGemini(
+      { ...baseConfig, geminiApiKey: "test-key" },
+      {
+        repoFullName: "example/repo",
+        pullRequest: {
+          number: 42,
+          title: "Fix pagination and tweak label copy",
+          body: "This PR fixes pagination and renames one label.",
+          changedFilesCount: 6,
+        },
+        relevantSourceFilesCount: 5,
+        relevantTestFilesCount: 1,
+        relevantCodeLinesChanged: 420,
+        issues: [
+          {
+            owner: "example",
+            repo: "repo",
+            number: 12,
+            title: "Fix broken API pagination",
+            body: "Pagination stops after page two and breaks clients.",
+          },
+          {
+            owner: "example",
+            repo: "repo",
+            number: 13,
+            title: "Rename a label",
+            body: "Rename the settings label to be clearer.",
+          },
+        ],
+      },
+    );
+
+    assert.equal(review?.status, "mixed");
+    assert.equal(review?.issues.length, 2);
+    assert.equal(review?.issues[0].issueKey, "example/repo#12");
+    assert.equal(review?.issues[0].status, "accepted_by_gemini");
+    assert.equal(review?.issues[1].status, "not_accepted_by_gemini");
+    assert.match(review?.summary || "", /too small/i);
+    assert.match(review?.analyzedAt || "", /\d{4}-\d{2}-\d{2}T/);
+  } finally {
+    globalThis.fetch = originalFetch;
   }
 });

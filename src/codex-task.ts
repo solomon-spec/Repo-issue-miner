@@ -8,6 +8,7 @@ import {
   CodexPrContext,
   CodexReviewDraft,
   CodexTaskRound,
+  CodexTaskState,
   PullRequestFile,
   PromptDraft,
 } from "./types.js";
@@ -111,15 +112,64 @@ export function buildPromptOne(issue: CodexIssueSource): string {
   const title = issue.title.trim();
   const body = issue.body?.trim();
   const lines = [
-    "Address the following GitHub issue in the current repository.",
+    "Work in the current repository and resolve the issue below without widening the scope.",
     "",
-    `Issue title: ${title}`,
+    title.endsWith(".") ? title : `${title}.`,
   ];
   if (body) {
-    lines.push("", "Issue description:", "", body);
+    lines.push("", body);
   }
-  lines.push("", "Keep the original scope, constraints, and issue-specific terminology intact.");
+  lines.push("", "Preserve the original constraints and issue-specific terminology while turning this into a production-ready fix.");
   return lines.join("\n");
+}
+
+export function buildPromptOneRewriteInstructions(issue: CodexIssueSource): string {
+  const lines = [
+    "Rewrite the GitHub issue below into a natural instruction-style coding prompt for Codex.",
+    "",
+    "Requirements:",
+    "- Rephrase the issue instead of copying it verbatim.",
+    "- Preserve the concrete bug, scope, constraints, and issue-specific terminology.",
+    "- Keep the prompt grounded in the current repository.",
+    "- Do not add new requirements, new files, or extra scope that the issue does not ask for.",
+    "- Avoid labels like 'Issue title', 'Issue description', or 'GitHub issue'.",
+    "- Return concise, direct prompt text that is ready to paste into Codex.",
+    "",
+    `Issue title: ${issue.title.trim()}`,
+  ];
+  if (issue.body?.trim()) {
+    lines.push("", "Issue body:", "", issue.body.trim());
+  }
+  lines.push("", "Return JSON only with a single string field named \"prompt\".");
+  return lines.join("\n");
+}
+
+export function buildPromptOneRewriteSchema(): Record<string, unknown> {
+  return {
+    type: "object",
+    additionalProperties: false,
+    required: ["prompt"],
+    properties: {
+      prompt: { type: "string" },
+    },
+  };
+}
+
+export function parsePromptOneRewriteOutput(raw: string): string {
+  const stripped = stripMarkdownFence(raw);
+  const parsed = JSON.parse(stripped) as Record<string, unknown>;
+  const prompt = typeof parsed.prompt === "string" ? parsed.prompt.trim() : "";
+  if (!prompt) {
+    throw new Error("Codex prompt rewrite output did not include a prompt");
+  }
+  if (
+    /address the following github issue in the current repository/i.test(prompt)
+    || /issue title:/i.test(prompt)
+    || /issue description:/i.test(prompt)
+  ) {
+    throw new Error("Codex prompt rewrite output fell back to the legacy issue-copy format");
+  }
+  return prompt;
 }
 
 export function buildFollowUpPrompt(round: number, unresolvedCons: readonly string[]): string {
@@ -159,6 +209,54 @@ export function summarizePullRequestFiles(files: PullRequestFile[], limit = 20):
     changes: file.changes,
     status: file.status,
   }));
+}
+
+export function reopenLastCodexTaskRound(task: CodexTaskState): CodexTaskState {
+  const lastReviewedRound = task.rounds
+    .filter((round) => round.reviewDraft)
+    .reduce((maxRound, round) => Math.max(maxRound, round.round), 0);
+
+  if (lastReviewedRound < 1) {
+    throw new Error("No completed round is available to reopen.");
+  }
+
+  return {
+    ...task,
+    currentRound: lastReviewedRound,
+    prompts: task.prompts.filter((prompt) => prompt.round <= lastReviewedRound),
+    rounds: task.rounds
+      .filter((round) => round.round <= lastReviewedRound)
+      .map((round): CodexTaskRound => round.round === lastReviewedRound
+        ? {
+            round: round.round,
+            notesA: round.notesA,
+            notesB: round.notesB,
+          }
+        : round)
+      .sort((left, right) => left.round - right.round),
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+export function updateCodexTaskSettings(
+  task: CodexTaskState,
+  settings: {
+    hfiUuid: string;
+    originalRepoPath: string;
+    worktreeAPath: string;
+    worktreeBPath: string;
+    testCommand?: string;
+  },
+): CodexTaskState {
+  return {
+    ...task,
+    hfiUuid: settings.hfiUuid,
+    originalRepoPath: settings.originalRepoPath,
+    worktreeAPath: settings.worktreeAPath,
+    worktreeBPath: settings.worktreeBPath,
+    testCommand: settings.testCommand,
+    updatedAt: new Date().toISOString(),
+  };
 }
 
 export function buildIssueMarkdown(issue: CodexIssueSource): string {
