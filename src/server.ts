@@ -25,7 +25,7 @@ import {
 import { runScan } from "./pipeline.js";
 import { cleanupSnapshot, prepareSnapshot } from "./git.js";
 import { executeTestPlan, executeTestPlanWithTests } from "./docker.js";
-import { fixDockerfileForTestFailure, generateDockerfileForTests, resolveTestPlan } from "./gemini.js";
+import { analyzeAcceptedPullRequestWithGemini, fixDockerfileForTestFailure, generateDockerfileForTests, resolveTestPlan } from "./gemini.js";
 import { GitHubClient } from "./github.js";
 import {
   createSetupProfile,
@@ -57,14 +57,18 @@ import {
 import {
   buildCodexReviewPrompt,
   buildFollowUpPrompt,
-  buildPromptOne,
+  buildPromptOneRewriteInstructions,
+  buildPromptOneRewriteSchema,
   buildTmuxSessionInfo,
   CODEX_AXIS_NAMES,
   CODEX_TASK_MAX_PROMPTS,
   createFallbackReviewDraft,
   makePromptDraft,
   parseCodexReviewOutput,
+  parsePromptOneRewriteOutput,
+  reopenLastCodexTaskRound,
   summarizePullRequestFiles,
+  updateCodexTaskSettings,
   writeReviewBundle,
 } from "./codex-task.js";
 import { parseSetupPathList } from "./setup.js";
@@ -221,6 +225,15 @@ function codexReviewStateToApi(run: ActiveCodexReviewRunState): Record<string, u
     artifactDir: run.artifactDir ?? null,
     error: run.error ?? null,
   };
+}
+
+function hasRunningCodexReview(candidateId: number): boolean {
+  for (const run of activeCodexReviewRunStates.values()) {
+    if (run.candidateId === candidateId && run.status === "running") {
+      return true;
+    }
+  }
+  return false;
 }
 
 function rerunStateToApi(rerun: ActiveTestRerunState): Record<string, unknown> {
@@ -512,6 +525,10 @@ function reviewArtifactDir(config: Config, candidateId: number, round: number): 
   return resolve(config.outputRoot, "codex-reviews", `candidate-${candidateId}`, `round-${round}`);
 }
 
+function promptRewriteArtifactDir(config: Config, candidateId: number): string {
+  return resolve(config.outputRoot, "codex-prompt-rewrites", `candidate-${candidateId}`);
+}
+
 function assertAbsoluteExistingPath(pathValue: unknown, label: string): string {
   const value = asNonEmptyString(pathValue);
   if (!value) {
@@ -558,11 +575,111 @@ async function readCommandOutput(
   return result.stdout.trim() || combined;
 }
 
+async function rewritePromptOneWithCodex(
+  config: Config,
+  candidateId: number,
+  issue: CodexIssueSource,
+  originalRepoPath: string,
+): Promise<string> {
+  const artifactDir = promptRewriteArtifactDir(config, candidateId);
+  ensureDir(artifactDir);
+
+  const schemaPath = join(artifactDir, "prompt-output.schema.json");
+  const outputPath = join(artifactDir, "codex-last-message.json");
+  const promptPath = join(artifactDir, "codex-instructions.txt");
+  const issuePath = join(artifactDir, "issue.json");
+  const codexPrompt = buildPromptOneRewriteInstructions(issue);
+
+  writeJson(issuePath, issue);
+  writeJson(schemaPath, buildPromptOneRewriteSchema());
+  writeFileSync(promptPath, codexPrompt, "utf8");
+
+  const codexResult = await runCommand({
+    cmd: "codex",
+    args: [
+      "exec",
+      "-C",
+      artifactDir,
+      "-s",
+      "read-only",
+      "--skip-git-repo-check",
+      "--output-schema",
+      schemaPath,
+      "-o",
+      outputPath,
+      "--add-dir",
+      originalRepoPath,
+      "-",
+    ],
+    stdinText: codexPrompt,
+    timeoutMs: 90_000,
+  });
+
+  if (codexResult.code !== 0) {
+    throw new Error(`${codexResult.stderr || codexResult.stdout || "codex prompt rewrite failed"}`.trim());
+  }
+
+  const rawOutput = readUtf8Safe(outputPath) ?? codexResult.stdout;
+  return parsePromptOneRewriteOutput(rawOutput);
+}
+
 function normalizeReviewStatus(value: unknown): "new" | "reviewing" | "approved" | "follow_up" {
   if (value === "reviewing" || value === "approved" || value === "follow_up") {
     return value;
   }
   return "new";
+}
+
+function issueRowKey(issue: any): string | undefined {
+  const owner = asNonEmptyString(issue?.owner);
+  const repo = asNonEmptyString(issue?.repo);
+  const number = Number(issue?.number);
+  if (!owner || !repo || !Number.isFinite(number)) {
+    return undefined;
+  }
+  return `${owner}/${repo}#${number}`;
+}
+
+function rejectAcceptedCandidateRow(
+  db: ReturnType<typeof getDb>,
+  row: any,
+  options: {
+    reason: string;
+    scope: "issue" | "repo";
+    issueKey?: string;
+  },
+): any {
+  const details = safeParseJson<Record<string, unknown>>(row.details_json, {});
+  const now = new Date().toISOString();
+  const existingReviewQueue = asRecord(details.reviewQueue);
+  const rejectionReasons = unique([
+    ...safeParseJson<string[]>(row.rejection_reasons, []),
+    options.reason,
+  ]);
+
+  details.manualReview = {
+    rejected: true,
+    rejectedAt: now,
+    reason: options.reason,
+    scope: options.scope,
+    issueKey: options.issueKey ?? null,
+  };
+  details.reviewQueue = {
+    status: "follow_up",
+    notes: options.reason,
+    updatedAt: now,
+    createdAt: asNonEmptyString(existingReviewQueue?.createdAt) ?? now,
+  };
+
+  updateScanCandidateState(db, Number(row.id), {
+    accepted: false,
+    rejectionReasons,
+    testsUnableToRun: Boolean(row.tests_unable_to_run),
+    testsUnableToRunReason: typeof row.tests_unable_to_run_reason === "string" ? row.tests_unable_to_run_reason : undefined,
+    detailsJson: JSON.stringify(details),
+  });
+  refreshScanCounts(db, Number(row.scan_id));
+  return getScanCandidateById(db, Number(row.id));
 }
 
 function listDockerfilePaths(files: string[]): string[] {
@@ -1648,7 +1765,15 @@ export function createApp(config: Config): express.Express {
     const limit = Math.min(Number(req.query.limit) || 50, 200);
     const offset = Number(req.query.offset) || 0;
     const search = typeof req.query.search === "string" ? req.query.search : undefined;
-    res.json(getRepos(db, { search, limit, offset }));
+    const sortBy = typeof req.query.sortBy === "string" ? req.query.sortBy : undefined;
+    const sortDir = typeof req.query.sortDir === "string" ? req.query.sortDir : undefined;
+    const language = typeof req.query.language === "string" && req.query.language ? req.query.language : undefined;
+    const status = typeof req.query.status === "string" && req.query.status ? req.query.status : undefined;
+    const minStars = req.query.minStars ? Number(req.query.minStars) : undefined;
+    const data = getRepos(db, { search, limit, offset, sortBy, sortDir, language, status, minStars });
+    // Also return available languages so the frontend can build its language filter dynamically
+    const langs = db.prepare("SELECT DISTINCT primary_language FROM repos WHERE primary_language IS NOT NULL ORDER BY primary_language ASC").all() as Array<{ primary_language: string }>;
+    res.json({ ...data, languages: langs.map((l) => l.primary_language) });
   });
 
   app.get("/api/repos/:id", (req, res) => {
@@ -1838,29 +1963,136 @@ export function createApp(config: Config): express.Express {
     res.json(getIssues(db, { limit, offset }));
   });
 
+  const acceptedCandidateResponse = (row: any): Record<string, unknown> => ({
+    ...candidateRowToApi(row),
+    issues: getIssuesForCandidate(db, Number(row.id)),
+    activeTestRun: activeAcceptedTestRunStates.has(Number(row.id))
+      ? rerunStateToApi(activeAcceptedTestRunStates.get(Number(row.id)) as ActiveAcceptedTestRunState)
+      : null,
+    activeCodexReview: (() => {
+      const details = safeParseJson<Record<string, unknown>>(row.details_json, {});
+      const task = normalizeCodexTaskState(details);
+      if (!task) return null;
+      const active = activeCodexReviewRunStates.get(codexReviewRunKey(Number(row.id), task.currentRound));
+      return active ? codexReviewStateToApi(active) : null;
+    })(),
+  });
+
   app.get("/api/accepted", (req, res) => {
     const limit = Math.min(Number(req.query.limit) || 20, 100);
     const offset = Number(req.query.offset) || 0;
     const reviewStatus = typeof req.query.reviewStatus === "string" ? req.query.reviewStatus : "all";
-    const data = getAcceptedCandidates(db, { limit, offset, reviewStatus });
+    const repoId = Number(req.query.repoId);
+    const search = typeof req.query.search === "string" ? req.query.search : undefined;
+    const dockerStatus = typeof req.query.dockerStatus === "string" ? req.query.dockerStatus : "all";
+    const sortBy = typeof req.query.sortBy === "string" ? req.query.sortBy : undefined;
+    const sortDir = typeof req.query.sortDir === "string" ? req.query.sortDir : undefined;
+    const data = getAcceptedCandidates(db, {
+      limit,
+      offset,
+      reviewStatus,
+      repoId: Number.isFinite(repoId) ? repoId : undefined,
+      search,
+      dockerStatus,
+      sortBy,
+      sortDir,
+    });
     const issuesByCandidate = getIssuesForCandidateIds(db, data.rows.map((row) => Number(row.id)));
-    const rows = data.rows.map((row) => ({
-      ...candidateRowToApi(row),
-      issues: issuesByCandidate[Number(row.id)] ?? [],
-      activeTestRun: activeAcceptedTestRunStates.has(Number(row.id))
-        ? rerunStateToApi(activeAcceptedTestRunStates.get(Number(row.id)) as ActiveAcceptedTestRunState)
-        : null,
-      activeCodexReview: (() => {
-        const details = safeParseJson<Record<string, unknown>>(row.details_json, {});
-        const task = normalizeCodexTaskState(details);
-        if (!task) return null;
-        const active = activeCodexReviewRunStates.get(codexReviewRunKey(Number(row.id), task.currentRound));
-        return active ? codexReviewStateToApi(active) : null;
-      })(),
-    }));
+    const rows = data.rows.map((row) => {
+      const mapped = acceptedCandidateResponse(row);
+      return {
+        ...mapped,
+        issues: issuesByCandidate[Number(row.id)] ?? [],
+      };
+    });
     res.json({
       total: data.total,
       rows,
+      repoOptions: data.repoOptions,
+    });
+  });
+
+  app.get("/api/accepted/:id", (req, res) => {
+    const candidateId = Number(req.params.id);
+    if (!Number.isFinite(candidateId)) {
+      return res.status(400).json({ error: "invalid candidate id" });
+    }
+    const row = getScanCandidateById(db, candidateId);
+    if (!row || !row.accepted) {
+      return res.status(404).json({ error: "accepted candidate not found" });
+    }
+    return res.json(acceptedCandidateResponse(row));
+  });
+
+  app.post("/api/accepted/:id/analyze-with-gemini", async (req, res) => {
+    const candidateId = Number(req.params.id);
+    if (!Number.isFinite(candidateId)) {
+      return res.status(400).json({ error: "invalid candidate id" });
+    }
+    if (!config.geminiApiKey) {
+      return res.status(400).json({ error: "Gemini API key is not configured" });
+    }
+
+    const row = getScanCandidateById(db, candidateId);
+    if (!row) {
+      return res.status(404).json({ error: "accepted candidate not found" });
+    }
+    if (!row.accepted) {
+      return res.status(409).json({ error: "candidate is not currently accepted" });
+    }
+
+    const details = safeParseJson<Record<string, unknown>>(row.details_json, {});
+    const issues = getIssuesForCandidate(db, candidateId);
+    if (!issues.length) {
+      return res.status(400).json({ error: "no verified issues are saved for this candidate" });
+    }
+
+    const repo = toSearchRepo(row);
+    const fallbackPr = row.pr_number ? await github.getPullRequest(repo, Number(row.pr_number)).catch(() => undefined) : undefined;
+    const analysis = asRecord(details.analysis);
+    const review = await analyzeAcceptedPullRequestWithGemini(config, {
+      repoFullName: row.repo_full_name,
+      pullRequest: {
+        number: Number.isFinite(Number(row.pr_number)) ? Number(row.pr_number) : undefined,
+        title: asNonEmptyString(row.pr_title),
+        body: asNonEmptyString(row.pr_body) ?? fallbackPr?.body,
+        mergedAt: asNonEmptyString(row.pr_merged_at) ?? fallbackPr?.mergedAt ?? undefined,
+        changedFilesCount: Number.isFinite(Number(row.pr_changed_files))
+          ? Number(row.pr_changed_files)
+          : fallbackPr?.changedFilesCount,
+      },
+      relevantSourceFilesCount: Array.isArray(analysis?.relevantSourceFiles) ? analysis.relevantSourceFiles.length : 0,
+      relevantTestFilesCount: Array.isArray(analysis?.relevantTestFiles) ? analysis.relevantTestFiles.length : 0,
+      relevantCodeLinesChanged: typeof analysis?.codeLinesChanged === "number"
+        ? analysis.codeLinesChanged
+        : Number(analysis?.codeLinesChanged ?? 0),
+      issues: issues.map((issue) => ({
+        owner: String(issue.owner),
+        repo: String(issue.repo),
+        number: Number(issue.number),
+        title: asNonEmptyString(issue.title),
+        body: asNonEmptyString(issue.body),
+        state: asNonEmptyString(issue.state),
+      })),
+    });
+
+    if (!review) {
+      return res.status(500).json({ error: "Gemini could not analyze this accepted pull request" });
+    }
+
+    details.geminiReview = review;
+    updateScanCandidateState(db, candidateId, {
+      accepted: Boolean(row.accepted),
+      rejectionReasons: safeParseJson<string[]>(row.rejection_reasons, []),
+      testsUnableToRun: Boolean(row.tests_unable_to_run),
+      testsUnableToRunReason: typeof row.tests_unable_to_run_reason === "string" ? row.tests_unable_to_run_reason : undefined,
+      detailsJson: JSON.stringify(details),
+    });
+
+    const updated = getScanCandidateById(db, candidateId);
+    return res.json({
+      ...candidateRowToApi(updated),
+      issues,
     });
   });
 
@@ -1906,7 +2138,17 @@ export function createApp(config: Config): express.Express {
       const issues = getIssuesForCandidate(db, candidateId);
       const issue = pickPrimaryIssue(issues, row);
       const prContext = await resolveCodexPrContext(github, row);
-      const promptOne = buildPromptOne(issue);
+      const codexCheck = await runCommand({ cmd: "which", args: ["codex"], timeoutMs: 15_000 });
+      if (codexCheck.code !== 0) {
+        throw new RequestValidationError("local codex CLI was not found in PATH, so Prompt 1 could not be generated");
+      }
+
+      let promptOne: string;
+      try {
+        promptOne = await rewritePromptOneWithCodex(config, candidateId, issue, originalRepoPath);
+      } catch (err) {
+        throw new RequestValidationError(`Prompt 1 generation failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
       const task: CodexTaskState = {
         hfiUuid,
         originalRepoPath,
@@ -1953,6 +2195,102 @@ export function createApp(config: Config): express.Express {
       ...payload,
       tmux: buildTmuxSessionInfo(payload.task.hfiUuid),
     });
+  });
+
+  app.post("/api/accepted/:id/codex-task/settings", async (req, res) => {
+    const candidateId = Number(req.params.id);
+    if (!Number.isFinite(candidateId)) {
+      return res.status(400).json({ error: "invalid candidate id" });
+    }
+    if (hasRunningCodexReview(candidateId)) {
+      return res.status(409).json({ error: "wait for the running Codex review to finish before updating task settings" });
+    }
+
+    const row = getScanCandidateById(db, candidateId);
+    if (!row) {
+      return res.status(404).json({ error: "accepted candidate not found" });
+    }
+    const details = safeParseJson<Record<string, unknown>>(row.details_json, {});
+    const task = normalizeCodexTaskState(details);
+    if (!task) {
+      return res.status(409).json({ error: "start the Codex task before updating task settings" });
+    }
+
+    try {
+      const requestBody = asRecord(req.body) ?? {};
+      const hfiUuid = asNonEmptyString(requestBody.hfiUuid);
+      if (!hfiUuid) {
+        throw new RequestValidationError("HFI UUID is required");
+      }
+      const originalRepoPath = assertAbsoluteExistingPath(requestBody.originalRepoPath, "Original repo path");
+      const worktreeAPath = assertAbsoluteExistingPath(requestBody.worktreeAPath, "Worktree A path");
+      const worktreeBPath = assertAbsoluteExistingPath(requestBody.worktreeBPath, "Worktree B path");
+      const testCommand = asNonEmptyString(requestBody.testCommand);
+      if (worktreeAPath === worktreeBPath) {
+        throw new RequestValidationError("Worktree A path and Worktree B path must be different");
+      }
+      if (originalRepoPath === worktreeAPath || originalRepoPath === worktreeBPath) {
+        throw new RequestValidationError("Original repo path must be different from the A and B worktree paths");
+      }
+
+      await Promise.all([
+        assertGitRepository(originalRepoPath, "Original repo path"),
+        assertGitRepository(worktreeAPath, "Worktree A path"),
+        assertGitRepository(worktreeBPath, "Worktree B path"),
+      ]);
+
+      const updatedTask = updateCodexTaskSettings(task, {
+        hfiUuid,
+        originalRepoPath,
+        worktreeAPath,
+        worktreeBPath,
+        testCommand,
+      });
+      persistCodexTask(row, details, updatedTask);
+      const updated = getScanCandidateById(db, candidateId);
+      const updatedDetails = safeParseJson<Record<string, unknown>>(updated.details_json, {});
+      return res.json({
+        ...codexTaskPayload(updated, updatedDetails),
+        tmux: buildTmuxSessionInfo(updatedTask.hfiUuid),
+      });
+    } catch (err) {
+      const status = err instanceof RequestValidationError ? 400 : 500;
+      return res.status(status).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.post("/api/accepted/:id/codex-task/reopen-last-round", (req, res) => {
+    const candidateId = Number(req.params.id);
+    if (!Number.isFinite(candidateId)) {
+      return res.status(400).json({ error: "invalid candidate id" });
+    }
+    if (hasRunningCodexReview(candidateId)) {
+      return res.status(409).json({ error: "wait for the running Codex review to finish before reopening a round" });
+    }
+
+    const row = getScanCandidateById(db, candidateId);
+    if (!row) {
+      return res.status(404).json({ error: "accepted candidate not found" });
+    }
+    const details = safeParseJson<Record<string, unknown>>(row.details_json, {});
+    const task = normalizeCodexTaskState(details);
+    if (!task) {
+      return res.status(409).json({ error: "start the Codex task before reopening a round" });
+    }
+
+    try {
+      const updatedTask = reopenLastCodexTaskRound(task);
+      persistCodexTask(row, details, updatedTask);
+      const updated = getScanCandidateById(db, candidateId);
+      const updatedDetails = safeParseJson<Record<string, unknown>>(updated.details_json, {});
+      return res.json({
+        ...codexTaskPayload(updated, updatedDetails),
+        tmux: buildTmuxSessionInfo(updatedTask.hfiUuid),
+      });
+    } catch (err) {
+      const status = err instanceof Error ? 409 : 500;
+      return res.status(status).json({ error: err instanceof Error ? err.message : String(err) });
+    }
   });
 
   app.post("/api/accepted/:id/codex-task/round/:round/review", async (req, res) => {
@@ -2485,33 +2823,59 @@ export function createApp(config: Config): express.Express {
       return res.status(409).json({ error: "candidate is not currently accepted" });
     }
 
-    const details = safeParseJson<Record<string, unknown>>(row.details_json, {});
-    const now = new Date().toISOString();
-    const manualRejectReason = "manually rejected by user";
-    details.manualReview = {
-      rejected: true,
-      rejectedAt: now,
+    const issues = getIssuesForCandidate(db, candidateId);
+    const primaryIssueKey = issueRowKey(issues[0]);
+    const manualRejectReason = typeof asRecord(req.body)?.reason === "string" && String(asRecord(req.body)?.reason).trim()
+      ? String(asRecord(req.body)?.reason).trim()
+      : (primaryIssueKey ? `accepted issue manually rejected: ${primaryIssueKey}` : "accepted candidate manually rejected by user");
+    const updated = rejectAcceptedCandidateRow(db, row, {
       reason: manualRejectReason,
-    };
-    details.reviewQueue = {
-      status: "follow_up",
-      notes: asNonEmptyString(asRecord(details.reviewQueue)?.notes) ?? manualRejectReason,
-      updatedAt: now,
-      createdAt: asNonEmptyString(asRecord(details.reviewQueue)?.createdAt) ?? now,
-    };
-
-    updateScanCandidateState(db, candidateId, {
-      accepted: Boolean(row.accepted),
-      rejectionReasons: safeParseJson<string[]>(row.rejection_reasons, []),
-      testsUnableToRun: Boolean(row.tests_unable_to_run),
-      testsUnableToRunReason: typeof row.tests_unable_to_run_reason === "string" ? row.tests_unable_to_run_reason : undefined,
-      detailsJson: JSON.stringify(details),
+      scope: "issue",
+      issueKey: primaryIssueKey,
     });
 
-    const updated = getScanCandidateById(db, candidateId);
     return res.json({
       ...candidateRowToApi(updated),
       issues: getIssuesForCandidate(db, candidateId),
+    });
+  });
+
+  app.post("/api/accepted/repo/:repoId/manual-reject", (req, res) => {
+    const repoId = Number(req.params.repoId);
+    if (!Number.isFinite(repoId)) {
+      return res.status(400).json({ error: "invalid repo id" });
+    }
+
+    const repo = getRepoRecordById(db, repoId);
+    if (!repo) {
+      return res.status(404).json({ error: "repo not found" });
+    }
+
+    const acceptedRows = getAcceptedCandidates(db, {
+      limit: 5000,
+      offset: 0,
+      repoId,
+      reviewStatus: "all",
+      dockerStatus: "all",
+    }).rows;
+    if (!acceptedRows.length) {
+      return res.status(409).json({ error: "this repo has no currently accepted candidates" });
+    }
+
+    const manualRejectReason = typeof asRecord(req.body)?.reason === "string" && String(asRecord(req.body)?.reason).trim()
+      ? String(asRecord(req.body)?.reason).trim()
+      : `accepted repo manually rejected: ${repo.full_name}`;
+    for (const row of acceptedRows) {
+      rejectAcceptedCandidateRow(db, row, {
+        reason: manualRejectReason,
+        scope: "repo",
+      });
+    }
+
+    return res.json({
+      repoId,
+      repoFullName: repo.full_name,
+      rejectedCount: acceptedRows.length,
     });
   });
 

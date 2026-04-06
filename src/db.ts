@@ -258,11 +258,36 @@ export function repoHasAcceptedCandidate(db: Database.Database, fullName: string
   return Boolean(row);
 }
 
-export function getRepos(db: Database.Database, opts: { search?: string; limit?: number; offset?: number } = {}): { rows: any[]; total: number } {
+export function getRepos(
+  db: Database.Database,
+  opts: {
+    search?: string;
+    limit?: number;
+    offset?: number;
+    sortBy?: string;
+    sortDir?: string;
+    language?: string;
+    status?: string;
+    minStars?: number;
+  } = {},
+): { rows: any[]; total: number } {
   const limit = opts.limit ?? 50;
   const offset = opts.offset ?? 0;
-  const where = opts.search ? "WHERE r.full_name LIKE @search OR r.description LIKE @search" : "";
-  const params: any = opts.search ? { search: `%${opts.search}%` } : {};
+  const whereParts: string[] = [];
+  const params: any = {};
+  if (opts.search) {
+    whereParts.push("(r.full_name LIKE @search OR r.description LIKE @search)");
+    params.search = `%${opts.search}%`;
+  }
+  if (opts.language) {
+    whereParts.push("LOWER(r.primary_language) = LOWER(@language)");
+    params.language = opts.language;
+  }
+  if (typeof opts.minStars === "number" && opts.minStars > 0) {
+    whereParts.push("r.stars >= @minStars");
+    params.minStars = opts.minStars;
+  }
+
   const candidateSummaryCte = `
     WITH latest_candidates AS (
       SELECT
@@ -301,21 +326,60 @@ export function getRepos(db: Database.Database, opts: { search?: string; limit?:
           AND i2.repo = sic.issue_repo
           AND i2.number = sic.issue_number
       ) = 1
+    ),
+    repo_stats AS (
+      SELECT
+        r2.id AS repo_id,
+        (SELECT COUNT(*) FROM latest_candidates lc WHERE lc.repo_id = r2.id AND lc.row_rank = 1 AND lc.accepted = 1) as accepted_count,
+        (SELECT COUNT(*) FROM latest_candidates lc WHERE lc.repo_id = r2.id AND lc.row_rank = 1 AND lc.accepted = 0) as rejected_count,
+        (SELECT COUNT(*) FROM latest_candidates lc WHERE lc.repo_id = r2.id AND lc.row_rank = 1 AND lc.pr_id IS NOT NULL) as scanned_pr_count,
+        (SELECT COUNT(*) FROM latest_candidates lc WHERE lc.repo_id = r2.id AND lc.row_rank = 1 AND lc.pr_id IS NOT NULL AND COALESCE(json_extract(lc.details_json, '$.basicFilterPassed'), 0) = 1) as basic_filter_pass_count,
+        (SELECT COUNT(*) FROM qualified_candidates qc WHERE qc.repo_id = r2.id) as issue_count
+      FROM repos r2
     )
   `;
 
-  const total = (db.prepare(`SELECT COUNT(*) as cnt FROM repos r ${where}`).get(params) as any).cnt;
+  // Status filter uses the CTE so we need to apply it differently
+  const statusFilter = opts.status === "accepted"
+    ? "AND rs.accepted_count > 0"
+    : opts.status === "rejected"
+      ? "AND rs.accepted_count = 0"
+      : "";
+
+  const where = whereParts.length ? `WHERE ${whereParts.join(" AND ")}` : "";
+
+  // Normalise sort column
+  const allowedSortColumns: Record<string, string> = {
+    repo: "r.full_name",
+    stars: "r.stars",
+    language: "r.primary_language",
+    issues: "rs.issue_count",
+    status: "rs.accepted_count",
+    updated: "r.updated_at",
+  };
+  const sortCol = allowedSortColumns[opts.sortBy ?? ""] ?? "r.updated_at";
+  const sortDir = opts.sortDir === "asc" ? "ASC" : "DESC";
+
+  const total = (db.prepare(`
+    ${candidateSummaryCte}
+    SELECT COUNT(*) as cnt FROM repos r
+    JOIN repo_stats rs ON rs.repo_id = r.id
+    ${where} ${statusFilter}
+  `).get(params) as any).cnt;
+
   const rows = db.prepare(`
     ${candidateSummaryCte}
     SELECT r.*,
-      (SELECT COUNT(*) FROM latest_candidates lc WHERE lc.repo_id = r.id AND lc.row_rank = 1 AND lc.accepted = 1) as accepted_count,
-      (SELECT COUNT(*) FROM latest_candidates lc WHERE lc.repo_id = r.id AND lc.row_rank = 1 AND lc.accepted = 0) as rejected_count,
-      (SELECT COUNT(*) FROM latest_candidates lc WHERE lc.repo_id = r.id AND lc.row_rank = 1 AND lc.pr_id IS NOT NULL) as scanned_pr_count,
-      (SELECT COUNT(*) FROM latest_candidates lc WHERE lc.repo_id = r.id AND lc.row_rank = 1 AND lc.pr_id IS NOT NULL AND COALESCE(json_extract(lc.details_json, '$.basicFilterPassed'), 0) = 1) as basic_filter_pass_count,
-      (SELECT COUNT(*) FROM qualified_candidates qc WHERE qc.repo_id = r.id) as pr_count,
-      (SELECT COUNT(*) FROM qualified_candidates qc WHERE qc.repo_id = r.id) as issue_count
-    FROM repos r ${where}
-    ORDER BY r.updated_at DESC
+      rs.accepted_count,
+      rs.rejected_count,
+      rs.scanned_pr_count,
+      rs.basic_filter_pass_count,
+      rs.issue_count as pr_count,
+      rs.issue_count
+    FROM repos r
+    JOIN repo_stats rs ON rs.repo_id = r.id
+    ${where} ${statusFilter}
+    ORDER BY ${sortCol} ${sortDir}
     LIMIT ${limit} OFFSET ${offset}
   `).all(params);
   return { rows, total };
@@ -474,7 +538,7 @@ function mapSetupRunRow(row: any): SetupRunRecord {
     issueTitle: typeof row.issue_title === "string" && row.issue_title ? row.issue_title : undefined,
     profileId: typeof row.profile_id === "number" ? row.profile_id : undefined,
     profileName: typeof row.profile_name === "string" && row.profile_name ? row.profile_name : undefined,
-    status: row.status === "completed" || row.status === "failed" || row.status === "stopped" ? row.status : "running",
+    status: row.status === "completed" || row.status === "failed" || row.status === "stopped" || row.status === "skipped" ? row.status : "running",
     prompt: String(row.prompt),
     contextPaths: parseJsonList(row.context_paths_json),
     writablePaths: parseJsonList(row.writable_paths_json),
@@ -968,8 +1032,17 @@ export function getTestsUnableCandidates(db: Database.Database, limit = 50): { r
 
 export function getAcceptedCandidates(
   db: Database.Database,
-  opts: { limit?: number; offset?: number; reviewStatus?: string } = {},
-): { rows: any[]; total: number } {
+  opts: {
+    limit?: number;
+    offset?: number;
+    reviewStatus?: string;
+    repoId?: number;
+    search?: string;
+    dockerStatus?: string;
+    sortBy?: string;
+    sortDir?: string;
+  } = {},
+): { rows: any[]; total: number; repoOptions: any[] } {
   const limit = opts.limit ?? 50;
   const offset = opts.offset ?? 0;
   const reviewStatus = opts.reviewStatus === "reviewing"
@@ -978,12 +1051,30 @@ export function getAcceptedCandidates(
     || opts.reviewStatus === "new"
     ? opts.reviewStatus
     : "all";
+  const dockerStatus = opts.dockerStatus === "passed"
+    || opts.dockerStatus === "failed"
+    || opts.dockerStatus === "not_run"
+    ? opts.dockerStatus
+    : "all";
+  const sortBy = opts.sortBy === "issues"
+    || opts.sortBy === "pr"
+    || opts.sortBy === "review"
+    || opts.sortBy === "created"
+    || opts.sortBy === "merged"
+    ? opts.sortBy
+    : "merged";
+  const sortDir = opts.sortDir === "asc" ? "ASC" : "DESC";
   const params = {
     reviewStatus,
+    dockerStatus,
     limit,
     offset,
+    repoId: Number.isFinite(Number(opts.repoId)) ? Number(opts.repoId) : null,
+    searchLike: typeof opts.search === "string" && opts.search.trim()
+      ? `%${opts.search.trim().toLowerCase()}%`
+      : null,
   };
-  const rankedCandidatesCte = `
+  const acceptedCandidatesCte = `
     WITH ranked_candidates AS (
       SELECT
         sc.*,
@@ -992,41 +1083,107 @@ export function getAcceptedCandidates(
           ORDER BY sc.id DESC
         ) AS row_rank
       FROM scan_candidates sc
+    ),
+    candidate_issue_counts AS (
+      SELECT
+        rc.id AS candidate_id,
+        COUNT(i.id) AS issue_count
+      FROM ranked_candidates rc
+      LEFT JOIN issues i ON i.pr_id = rc.pr_id
+      WHERE rc.row_rank = 1
+      GROUP BY rc.id
+    ),
+    accepted_candidates AS (
+      SELECT
+        rc.*,
+        s.id as scan_id,
+        s.status as scan_status,
+        s.started_at as scan_started_at,
+        r.full_name as repo_full_name,
+        r.url as repo_url,
+        r.stars as repo_stars,
+        r.primary_language as repo_primary_language,
+        r.description as repo_description,
+        pr.number as pr_number,
+        pr.title as pr_title,
+        pr.body as pr_body,
+        pr.url as pr_url,
+        pr.changed_files as pr_changed_files,
+        pr.merged_at as pr_merged_at,
+        COALESCE(cic.issue_count, 0) as issue_count,
+        COALESCE(NULLIF(json_extract(rc.details_json, '$.reviewQueue.status'), ''), 'new') as review_status,
+        CASE
+          WHEN json_extract(rc.details_json, '$.acceptedTest.lastRun.finishedAt') IS NULL THEN 'not_run'
+          WHEN COALESCE(json_extract(rc.details_json, '$.acceptedTest.lastRun.success'), 0) = 1 THEN 'passed'
+          ELSE 'failed'
+        END as docker_status
+      FROM ranked_candidates rc
+      JOIN scans s ON s.id = rc.scan_id
+      JOIN repos r ON r.id = rc.repo_id
+      LEFT JOIN pull_requests pr ON pr.id = rc.pr_id
+      LEFT JOIN candidate_issue_counts cic ON cic.candidate_id = rc.id
+      WHERE rc.row_rank = 1
+        AND rc.accepted = 1
     )
   `;
-  const rankedWhere = [
-    "rc.row_rank = 1",
-    "rc.accepted = 1",
+  const acceptedWhere = [
     reviewStatus === "all"
       ? ""
-      : "COALESCE(NULLIF(json_extract(rc.details_json, '$.reviewQueue.status'), ''), 'new') = @reviewStatus",
+      : "ac.review_status = @reviewStatus",
+    dockerStatus === "all"
+      ? ""
+      : "ac.docker_status = @dockerStatus",
+    params.repoId === null
+      ? ""
+      : "ac.repo_id = @repoId",
+    params.searchLike
+      ? "(LOWER(ac.repo_full_name) LIKE @searchLike OR LOWER(COALESCE(ac.pr_title, '')) LIKE @searchLike OR CAST(COALESCE(ac.pr_number, '') AS TEXT) LIKE @searchLike)"
+      : "",
   ].filter(Boolean).join(" AND ");
+  const repoFacetWhere = [
+    reviewStatus === "all"
+      ? ""
+      : "ac.review_status = @reviewStatus",
+    dockerStatus === "all"
+      ? ""
+      : "ac.docker_status = @dockerStatus",
+  ].filter(Boolean).join(" AND ") || "1 = 1";
+  const secondarySortColumn = {
+    merged: "COALESCE(ac.pr_merged_at, ac.created_at)",
+    issues: "ac.issue_count",
+    pr: "ac.pr_number",
+    review: "CASE ac.review_status WHEN 'new' THEN 0 WHEN 'reviewing' THEN 1 WHEN 'follow_up' THEN 2 WHEN 'approved' THEN 3 ELSE 4 END",
+    created: "ac.created_at",
+  }[sortBy] || "COALESCE(ac.pr_merged_at, ac.created_at)";
+  const orderBy = `ac.repo_full_name ASC, ${secondarySortColumn} ${sortDir}, ac.id DESC`;
 
-  const total = (db.prepare(`${rankedCandidatesCte} SELECT COUNT(*) as cnt FROM ranked_candidates rc WHERE ${rankedWhere}`).get(params) as any).cnt;
+  const total = (db.prepare(`
+    ${acceptedCandidatesCte}
+    SELECT COUNT(*) as cnt
+    FROM accepted_candidates ac
+    ${acceptedWhere ? `WHERE ${acceptedWhere}` : ""}
+  `).get(params) as any).cnt;
   const rows = db.prepare(`
-    ${rankedCandidatesCte}
-    SELECT
-      rc.*,
-      s.id as scan_id,
-      s.status as scan_status,
-      s.started_at as scan_started_at,
-      r.full_name as repo_full_name,
-      r.url as repo_url,
-      r.stars as repo_stars,
-      r.primary_language as repo_primary_language,
-      pr.number as pr_number,
-      pr.title as pr_title,
-      pr.url as pr_url,
-      pr.merged_at as pr_merged_at
-    FROM ranked_candidates rc
-    JOIN scans s ON s.id = rc.scan_id
-    JOIN repos r ON r.id = rc.repo_id
-    LEFT JOIN pull_requests pr ON pr.id = rc.pr_id
-    WHERE ${rankedWhere}
-    ORDER BY rc.created_at DESC, rc.id DESC
+    ${acceptedCandidatesCte}
+    SELECT ac.*
+    FROM accepted_candidates ac
+    ${acceptedWhere ? `WHERE ${acceptedWhere}` : ""}
+    ORDER BY ${orderBy}
     LIMIT @limit OFFSET @offset
   `).all(params);
-  return { rows, total };
+  const repoOptions = db.prepare(`
+    ${acceptedCandidatesCte}
+    SELECT
+      ac.repo_id as id,
+      ac.repo_full_name as full_name,
+      MAX(ac.repo_primary_language) as primary_language,
+      COUNT(*) as candidate_count
+    FROM accepted_candidates ac
+    WHERE ${repoFacetWhere}
+    GROUP BY ac.repo_id, ac.repo_full_name
+    ORDER BY ac.repo_full_name ASC
+  `).all(params);
+  return { rows, total, repoOptions };
 }
 
 export function getIssuesForCandidate(db: Database.Database, candidateId: number): any[] {
@@ -1087,7 +1244,10 @@ export function getScanCandidateById(db: Database.Database, id: number): any {
       r.description as repo_description,
       pr.number as pr_number,
       pr.title as pr_title,
-      pr.url as pr_url
+      pr.body as pr_body,
+      pr.url as pr_url,
+      pr.changed_files as pr_changed_files,
+      pr.merged_at as pr_merged_at
     FROM scan_candidates sc
     JOIN scans s ON s.id = sc.scan_id
     JOIN repos r ON r.id = sc.repo_id

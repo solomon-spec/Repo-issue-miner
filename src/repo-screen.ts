@@ -13,8 +13,7 @@ export function screenRepository(repo: SearchRepo, tree: RepoTreeItem[], readme?
   const hasRequirements = lowerPaths.some((path) => path.startsWith("requirements") && path.endsWith(".txt"));
   const hasEnvironmentYaml = lowerPaths.includes("environment.yml") || lowerPaths.includes("environment.yaml");
   const hasDockerfile = lowerPaths.includes("dockerfile") || lowerPaths.some((path) => /(^|\/)dockerfile(\.[^/]+)?$/i.test(path));
-  const hasTests = hasPath(tree, (path) => /(^|\/)(tests?|__tests__)(\/|$)/i.test(path))
-    || hasPath(tree, (path) => /(test|spec)\.(py|js|jsx|ts|tsx)$/i.test(path));
+  const hasTests = hasPath(tree, (path) => /(^|\/)(tests?|__tests__|spec|specs)(\/|$)/i.test(path));
   const hasBuildHints = Boolean(readme && /(install|setup|usage|run|test|docker)/i.test(readme));
   const readmeEnglishLikely = Boolean(readme && englishHeuristic(readme));
 
@@ -41,7 +40,7 @@ export function screenRepository(repo: SearchRepo, tree: RepoTreeItem[], readme?
     treeCount: tree.length,
     interestingPaths: tree
       .map((item) => item.path)
-      .filter((path) => /(^|\/)(package\.json|pyproject\.toml|requirements.*\.txt|environment\.ya?ml|dockerfile|docker-compose\.ya?ml|compose\.ya?ml|tests?|__tests__|readme)/i.test(path))
+      .filter((path) => /(^|\/)(package\.json|pyproject\.toml|requirements.*\.txt|environment\.ya?ml|dockerfile|docker-compose\.ya?ml|compose\.ya?ml|tests?|__tests__|spec|specs|readme)/i.test(path))
       .slice(0, 50),
   };
 }

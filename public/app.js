@@ -23,7 +23,7 @@
   }
 
   function badgeClassForStatus(status) {
-    return { running: "badge-running", completed: "badge-completed", failed: "badge-failed", stopped: "badge-warn" }[status] || "badge-warn";
+    return { running: "badge-running", completed: "badge-completed", failed: "badge-failed", stopped: "badge-warn", skipped: "badge-info" }[status] || "badge-warn";
   }
 
   function statusBadge(status) {
@@ -185,7 +185,7 @@
   }
 
   /* ---- Navigation ---- */
-  const pages = ["dashboard", "repos", "setup", "accepted", "tasks", "issues", "scans", "new-scan"];
+  const pages = ["dashboard", "repos", "setup", "accepted", "accepted-detail", "tasks", "issues", "scans", "new-scan"];
   let currentPage = "dashboard";
   const selectedRepoIds = new Set();
   let visibleRepoIds = [];
@@ -202,22 +202,34 @@
     scrollTop: 0,
     autoFollow: true,
   };
+  let activeSetupRunDetail = null;
+  let setupRunDetailState = {
+    runId: null,
+    tab: "overview",
+  };
 
   function switchPage(page) {
     if (page !== "setup") {
       stopSetupRunPolling();
     }
+    if (!["accepted", "accepted-detail"].includes(page)) {
+      stopAcceptedTestRunPolling();
+    }
+    if (!["accepted", "accepted-detail", "tasks"].includes(page)) {
+      stopAcceptedCodexReviewPolling();
+    }
     currentPage = page;
+    const activeNavPage = page === "accepted-detail" ? "accepted" : page;
     pages.forEach((p) => {
       const el = $(`#page-${p}`);
-      const nav = $(`#nav-${p.replace("-", "-")}`);
+      const navTarget = p === "accepted-detail" ? "accepted" : p;
+      const nav = $(`#nav-${navTarget.replace("-", "-")}`);
       if (!el) return;
       el.classList.toggle("active", p === page);
-      if (nav) nav.classList.toggle("active", p === page);
+      if (nav) nav.classList.toggle("active", navTarget === activeNavPage);
     });
-    // Fix nav link active states for the dashed name
     $$(".nav-links a").forEach((a) => {
-      a.classList.toggle("active", a.dataset.page === page);
+      a.classList.toggle("active", a.dataset.page === activeNavPage);
     });
     loadPage(page);
   }
@@ -349,6 +361,26 @@
     switchPage("tasks");
   }
 
+  function openAcceptedDetail(candidateId) {
+    if (!candidateId) return;
+    acceptedDetailCandidateId = String(candidateId);
+    switchPage("accepted-detail");
+  }
+
+  function showAcceptedRepoFilter(repoId) {
+    if (!repoId) return;
+    acceptedRepoFilter = String(repoId);
+    acceptedPage = 0;
+    if ($("#accepted-repo-filter")) {
+      $("#accepted-repo-filter").value = acceptedRepoFilter;
+    }
+    if (currentPage === "accepted") {
+      void loadAccepted();
+      return;
+    }
+    switchPage("accepted");
+  }
+
   /* ---- Dashboard ---- */
   async function loadDashboard() {
     try {
@@ -393,6 +425,10 @@
   /* ---- Repos ---- */
   let reposPage = 0;
   const REPOS_PER_PAGE = 20;
+  let reposSortCol = '';
+  let reposSortDir = 'desc';
+  let reposLanguageFilter = '';
+  let reposStatusFilter = '';
 
   function updateRepoBulkDeleteUI(rows = []) {
     const deleteBtn = $("#delete-selected-repos");
@@ -422,21 +458,61 @@
     try {
       const params = new URLSearchParams({ limit: REPOS_PER_PAGE, offset: reposPage * REPOS_PER_PAGE });
       if (search) params.set("search", search);
+      if (reposSortCol) params.set("sortBy", reposSortCol);
+      if (reposSortDir) params.set("sortDir", reposSortDir);
+      if (reposLanguageFilter) params.set("language", reposLanguageFilter);
+      if (reposStatusFilter) params.set("status", reposStatusFilter);
       const data = await api(`/api/repos?${params}`);
       const tbody = $("#repos-tbody");
       visibleRepoIds = data.rows.map((row) => Number(row.id));
 
+      // Populate the language filter dropdown dynamically
+      const langSelect = $("#repo-language-filter");
+      if (langSelect && Array.isArray(data.languages)) {
+        const current = langSelect.value;
+        langSelect.innerHTML = `<option value="">All Languages</option>` +
+          data.languages.map((lang) => `<option value="${esc(lang)}" ${lang === current ? 'selected' : ''}>${esc(lang)}</option>`).join("");
+      }
+
+      // Update sortable header indicators
+      $$(".sortable-header", $("#repos-table")).forEach((th) => {
+        const col = th.dataset.sortCol;
+        th.classList.remove("sort-asc", "sort-desc");
+        if (col === reposSortCol) {
+          th.classList.add(reposSortDir === "asc" ? "sort-asc" : "sort-desc");
+        }
+      });
+
+      // Render table summary
+      renderTableSummary("#repos-summary", data.total, REPOS_PER_PAGE, reposPage);
+
       if (data.rows.length === 0) {
-        tbody.innerHTML = `<tr><td colspan="8"><div class="empty-state"><div class="empty-icon">📦</div><p>No repos found. Start a scan to mine repositories.</p></div></td></tr>`;
+        tbody.innerHTML = `<tr><td colspan="8"><div class="empty-state"><div class="empty-icon">📦</div><p>No repos found matching your filters. ${search || reposLanguageFilter || reposStatusFilter ? '<a href="#" class="repo-link" id="clear-repo-filters">Clear all filters</a>' : 'Start a scan to mine repositories.'}</p></div></td></tr>`;
         $("#repos-pagination").innerHTML = "";
         updateRepoBulkDeleteUI([]);
+        const clearLink = $("#clear-repo-filters");
+        if (clearLink) {
+          clearLink.addEventListener("click", (e) => {
+            e.preventDefault();
+            $("#repo-search").value = "";
+            reposLanguageFilter = "";
+            reposStatusFilter = "";
+            if (langSelect) langSelect.value = "";
+            $("#repo-status-filter").value = "";
+            reposPage = 0;
+            loadRepos();
+          });
+        }
         return;
       }
 
       tbody.innerHTML = data.rows.map((r) => `
         <tr>
           <td><input type="checkbox" data-repo-select="${r.id}" ${selectedRepoIds.has(Number(r.id)) ? "checked" : ""} aria-label="Select ${esc(r.full_name)}"></td>
-          <td><a class="repo-link" data-repo-id="${r.id}">${esc(r.full_name)}</a></td>
+          <td>
+            <a href="https://github.com/${esc(r.full_name)}" target="_blank" class="repo-link-external" title="Open on GitHub">${esc(r.full_name)}</a>
+            <a class="repo-link-internal" data-repo-id="${r.id}" title="View details"> ⓘ</a>
+          </td>
           <td>⭐ ${r.stars}</td>
           <td>${esc(r.primary_language || "—")}</td>
           <td>${renderRepoPrProgress(r)}</td>
@@ -466,14 +542,23 @@
         });
       });
 
-      // Delete
+      // Delete with toast
       $$("[data-delete-repo]", tbody).forEach((btn) => {
         btn.addEventListener("click", async () => {
           if (!confirm("Remove this repo from the database? It will be eligible for re-scanning.")) return;
-          selectedRepoIds.delete(Number(btn.dataset.deleteRepo));
-          await api(`/api/repos/${btn.dataset.deleteRepo}`, { method: "DELETE" });
-          loadRepos($("#repo-search").value);
-          loadDashboard();
+          btn.disabled = true;
+          btn.textContent = "Deleting…";
+          try {
+            selectedRepoIds.delete(Number(btn.dataset.deleteRepo));
+            await api(`/api/repos/${btn.dataset.deleteRepo}`, { method: "DELETE" });
+            showToast("Repo deleted successfully", "success");
+            loadRepos($("#repo-search").value);
+            loadDashboard();
+          } catch (err) {
+            showToast("Failed to delete repo: " + err.message, "error");
+            btn.disabled = false;
+            btn.textContent = "Delete";
+          }
         });
       });
 
@@ -615,6 +700,35 @@
     repoSearchTimer = setTimeout(() => { reposPage = 0; loadRepos(e.target.value); }, 300);
   });
 
+  // Sortable header click handlers
+  $$(".sortable-header", $("#repos-table")).forEach((th) => {
+    th.addEventListener("click", () => {
+      const col = th.dataset.sortCol;
+      if (reposSortCol === col) {
+        reposSortDir = reposSortDir === "asc" ? "desc" : "asc";
+      } else {
+        reposSortCol = col;
+        reposSortDir = col === "stars" || col === "issues" || col === "status" ? "desc" : "asc";
+      }
+      reposPage = 0;
+      loadRepos($("#repo-search").value);
+    });
+  });
+
+  // Language filter handler
+  $("#repo-language-filter").addEventListener("change", (e) => {
+    reposLanguageFilter = e.target.value;
+    reposPage = 0;
+    loadRepos($("#repo-search").value);
+  });
+
+  // Status filter handler
+  $("#repo-status-filter").addEventListener("change", (e) => {
+    reposStatusFilter = e.target.value;
+    reposPage = 0;
+    loadRepos($("#repo-search").value);
+  });
+
   $("#select-all-repos").addEventListener("change", (e) => {
     visibleRepoIds.forEach((repoId) => {
       if (e.target.checked) selectedRepoIds.add(repoId);
@@ -633,15 +747,17 @@
 
     const button = $("#delete-selected-repos");
     button.disabled = true;
+    button.textContent = `Deleting ${ids.length}…`;
     try {
       for (const repoId of ids) {
         await api(`/api/repos/${repoId}`, { method: "DELETE" });
         selectedRepoIds.delete(repoId);
       }
+      showToast(`${ids.length} repo(s) deleted successfully`, 'success');
       await loadRepos($("#repo-search").value);
       await loadDashboard();
     } catch (err) {
-      alert("Failed to delete selected repos: " + err.message);
+      showToast("Failed to delete selected repos: " + err.message, 'error');
       updateRepoBulkDeleteUI(visibleRepoIds.map((id) => ({ id })));
     }
   });
@@ -802,6 +918,306 @@
     return items.map((item) => `<span class="setup-chip ${modifier}">${esc(item)}</span>`).join("");
   }
 
+  function parseSetupLogEntries(logs) {
+    if (!Array.isArray(logs)) return [];
+    return logs
+      .map((line) => {
+        const text = String(line || "");
+        const match = text.match(/^\[([^\]]+)\]\s*(.*)$/);
+        if (!match) return null;
+        return { raw: text, at: match[1], message: match[2] || "" };
+      })
+      .filter(Boolean);
+  }
+
+  function classifySetupEventTone(message, fallbackStatus = "") {
+    const text = String(message || "").toLowerCase();
+    if (/failed|error|out-of-scope/.test(text)) return "failed";
+    if (/skip_setup|skipped|blocked/.test(text)) return "info";
+    if (/stopped/.test(text)) return "warn";
+    if (/completed|passed|created setup commit/.test(text)) return "completed";
+    if (/running|preparing|configuring|removing|staging|creating/.test(text)) return "running";
+    return fallbackStatus || "info";
+  }
+
+  function extractSetupCommands(entries) {
+    const commands = [];
+    let codexCommand = null;
+
+    entries.forEach((entry) => {
+      const message = entry.message || "";
+      if (message.startsWith("Running command: ")) {
+        commands.push({
+          command: message.slice("Running command: ".length),
+          status: "running",
+          startedAt: entry.at,
+          finishedAt: null,
+          durationText: "",
+          source: "shell",
+        });
+        return;
+      }
+
+      let match = message.match(/^Command passed after (.+?): (.+)$/);
+      if (match) {
+        const pending = [...commands].reverse().find((item) => item.command === match[2] && item.status === "running");
+        if (pending) {
+          pending.status = "completed";
+          pending.finishedAt = entry.at;
+          pending.durationText = match[1];
+        } else {
+          commands.push({
+            command: match[2],
+            status: "completed",
+            startedAt: null,
+            finishedAt: entry.at,
+            durationText: match[1],
+            source: "shell",
+          });
+        }
+        return;
+      }
+
+      match = message.match(/^Command failed after (.+?): (.+?)(?: — .+)?$/);
+      if (match) {
+        const pending = [...commands].reverse().find((item) => item.command === match[2] && item.status === "running");
+        if (pending) {
+          pending.status = "failed";
+          pending.finishedAt = entry.at;
+          pending.durationText = match[1];
+        } else {
+          commands.push({
+            command: match[2],
+            status: "failed",
+            startedAt: null,
+            finishedAt: entry.at,
+            durationText: match[1],
+            source: "shell",
+          });
+        }
+        return;
+      }
+
+      if (message.startsWith("Running Codex via ")) {
+        codexCommand = {
+          command: "codex exec",
+          status: "running",
+          startedAt: entry.at,
+          finishedAt: null,
+          durationText: "",
+          source: "codex",
+          detail: message.slice("Running Codex via ".length),
+        };
+        commands.push(codexCommand);
+        return;
+      }
+
+      match = message.match(/^Codex exited with code (\S+) after (.+)$/);
+      if (match && codexCommand) {
+        codexCommand.status = match[1] === "0" ? "completed" : "failed";
+        codexCommand.finishedAt = entry.at;
+        codexCommand.durationText = match[2];
+      }
+    });
+
+    return commands;
+  }
+
+  function buildSetupTimeline(run, entries) {
+    const items = [{
+      title: "Run started",
+      detail: run.targetLabel || run.repoFullName,
+      at: run.startedAt,
+      tone: "running",
+    }];
+
+    const filtered = entries.filter((entry) => {
+      const message = entry.message || "";
+      return !/^Running command: /.test(message)
+        && !/^Command passed after /.test(message)
+        && !/^Command failed after /.test(message);
+    });
+
+    filtered.forEach((entry) => {
+      items.push({
+        title: entry.message,
+        detail: "",
+        at: entry.at,
+        tone: classifySetupEventTone(entry.message),
+      });
+    });
+
+    if (!filtered.length && run.stage) {
+      items.push({
+        title: run.stage,
+        detail: "",
+        at: run.finishedAt || run.startedAt,
+        tone: classifySetupEventTone(run.stage, run.status),
+      });
+    }
+
+    if (run.finishedAt) {
+      items.push({
+        title: run.status === "completed"
+          ? "Run completed"
+          : run.status === "failed"
+            ? "Run failed"
+            : run.status === "skipped"
+              ? "Run skipped"
+              : "Run stopped",
+        detail: run.error || "",
+        at: run.finishedAt,
+        tone: classifySetupEventTone(run.status, run.status),
+      });
+    }
+
+    return items.slice(-12);
+  }
+
+  function extractImportantSetupLines(run, consoleOutput) {
+    const important = [];
+    const seen = new Set();
+    const lines = [
+      ...(String(run.lastMessage || "").split(/\r?\n/g)),
+      ...(String(run.summary || "").split(/\r?\n/g)),
+      ...(String(consoleOutput || "").split(/\r?\n/g)),
+    ];
+    for (const rawLine of lines) {
+      const line = rawLine.trim();
+      if (!line) continue;
+      if (!/error|failed|warn|warning|skip_setup|blocked|docker build|docker run|pip freeze|pytest|test|typecheck|remaining blocker|removed lock files|created setup commit|out-of-scope/i.test(line)) {
+        continue;
+      }
+      if (seen.has(line)) continue;
+      seen.add(line);
+      important.push(line);
+      if (important.length >= 16) break;
+    }
+    if (!important.length) {
+      return String(consoleOutput || "").split(/\r?\n/g).map((line) => line.trim()).filter(Boolean).slice(-12);
+    }
+    return important;
+  }
+
+  function buildSetupOverviewMetrics(run, entries, commands) {
+    const startedAtMs = run.startedAt ? new Date(run.startedAt).getTime() : NaN;
+    const finishedAtMs = run.finishedAt ? new Date(run.finishedAt).getTime() : Date.now();
+    const elapsedMs = Number.isFinite(startedAtMs) ? Math.max(0, finishedAtMs - startedAtMs) : null;
+    const lastEntry = entries.at(-1);
+    return [
+      {
+        label: "Current Step",
+        value: run.status === "running" ? (run.stage || "Running setup") : (run.status || "—"),
+        tone: run.status === "failed" ? "failed" : run.status === "completed" ? "completed" : run.status === "skipped" ? "info" : "running",
+      },
+      {
+        label: "Elapsed",
+        value: elapsedMs === null ? "—" : fmtDuration(elapsedMs),
+        tone: "info",
+      },
+      {
+        label: "Commands",
+        value: String(commands.length),
+        tone: "info",
+      },
+      {
+        label: "Files Changed",
+        value: String(Array.isArray(run.changedFiles) ? run.changedFiles.length : 0),
+        tone: Array.isArray(run.violationFiles) && run.violationFiles.length ? "failed" : "completed",
+      },
+      {
+        label: "Out-of-Scope Edits",
+        value: String(Array.isArray(run.violationFiles) ? run.violationFiles.length : 0),
+        tone: Array.isArray(run.violationFiles) && run.violationFiles.length ? "failed" : "completed",
+      },
+      {
+        label: "Last Update",
+        value: lastEntry?.message || run.lastMessage || run.summary || "No summary yet",
+        tone: classifySetupEventTone(lastEntry?.message || run.status, run.status),
+      },
+    ];
+  }
+
+  function renderSetupMetricCards(metrics) {
+    return `
+      <div class="setup-metric-grid">
+        ${metrics.map((metric) => `
+          <div class="setup-metric-card setup-metric-${esc(metric.tone || "info")}">
+            <span class="setup-metric-label">${esc(metric.label)}</span>
+            <strong class="setup-metric-value">${esc(metric.value || "—")}</strong>
+          </div>
+        `).join("")}
+      </div>
+    `;
+  }
+
+  function renderSetupTimeline(items) {
+    if (!items.length) {
+      return `<div class="empty-state compact-empty"><p>No timeline events captured yet.</p></div>`;
+    }
+    return `
+      <div class="setup-timeline">
+        ${items.map((item) => `
+          <div class="setup-timeline-item">
+            <span class="setup-timeline-dot tone-${esc(item.tone || "info")}"></span>
+            <div class="setup-timeline-body">
+              <div class="setup-timeline-heading">
+                <strong>${esc(item.title || "Update")}</strong>
+                <span>${esc(item.at ? fmtDate(item.at) : "—")}</span>
+              </div>
+              ${item.detail ? `<p>${esc(item.detail)}</p>` : ""}
+            </div>
+          </div>
+        `).join("")}
+      </div>
+    `;
+  }
+
+  function renderSetupCommands(commands) {
+    if (!commands.length) {
+      return `<div class="empty-state compact-empty"><p>No structured command events captured yet.</p></div>`;
+    }
+    return `
+      <div class="setup-command-list">
+        ${commands.map((command) => `
+          <div class="setup-command-row">
+            <div class="setup-command-main">
+              <code>${esc(command.command)}</code>
+              ${command.detail ? `<span class="setup-command-detail">${esc(command.detail)}</span>` : ""}
+            </div>
+            <div class="setup-command-meta">
+              ${statusBadge(command.status || "running")}
+              <span>${esc(command.durationText || "—")}</span>
+            </div>
+          </div>
+        `).join("")}
+      </div>
+    `;
+  }
+
+  function renderSetupDetailTabs(activeTab) {
+    const tabs = [
+      ["overview", "Overview"],
+      ["commands", "Commands"],
+      ["files", "Files"],
+      ["diff", "Diff"],
+      ["terminal", "Raw Terminal"],
+    ];
+    return `
+      <div class="setup-detail-tabs" role="tablist" aria-label="Setup run details">
+        ${tabs.map(([id, label]) => `
+          <button
+            type="button"
+            class="setup-detail-tab ${activeTab === id ? "active" : ""}"
+            data-setup-detail-tab="${esc(id)}"
+            role="tab"
+            aria-selected="${activeTab === id ? "true" : "false"}"
+          >${esc(label)}</button>
+        `).join("")}
+      </div>
+    `;
+  }
+
   function renderSetupRunsTable(runs) {
     const tbody = $("#setup-runs-tbody");
     if (!tbody) return;
@@ -855,6 +1271,7 @@
     const container = $("#setup-run-detail");
     const stopButton = $("#setup-stop-run");
     if (!container || !stopButton) return;
+    activeSetupRunDetail = run || null;
 
     const existingTerminalOutput = $("[data-setup-terminal-output]", container);
     if (existingTerminalOutput && setupRunTerminalState.runId === selectedSetupRunId) {
@@ -873,14 +1290,79 @@
         scrollTop: 0,
         autoFollow: true,
       };
+      setupRunDetailState = {
+        runId: null,
+        tab: "overview",
+      };
       container.innerHTML = `<div class="empty-state"><div class="empty-icon">🧪</div><p>Select a setup run to inspect its prompt, output, changed files, and diff.</p></div>`;
       return;
+    }
+
+    if (setupRunDetailState.runId !== run.id) {
+      setupRunDetailState = {
+        runId: run.id,
+        tab: "overview",
+      };
     }
 
     stopButton.disabled = run.status !== "running";
     stopButton.dataset.runId = String(run.id);
     const consoleOutput = run.liveOutput || run.stdoutExcerpt || run.stderrExcerpt || run.lastMessage || "No terminal output captured yet.";
     const worktreePath = run.worktreePath || "Not recorded yet";
+    const entries = parseSetupLogEntries(run.logs || []);
+    const commands = extractSetupCommands(entries);
+    const timeline = buildSetupTimeline(run, entries);
+    const importantLines = extractImportantSetupLines(run, consoleOutput);
+    const metrics = buildSetupOverviewMetrics(run, entries, commands);
+    const activeTab = setupRunDetailState.tab || "overview";
+    const detailPanels = {
+      overview: `
+        <div class="setup-detail-section">
+          <span class="setup-detail-label">Run Overview</span>
+          ${renderSetupMetricCards(metrics)}
+          <div class="setup-two-column">
+            <div class="setup-detail-section nested">
+              <span class="setup-detail-label">Timeline</span>
+              ${renderSetupTimeline(timeline)}
+            </div>
+            <div class="setup-detail-section nested">
+              <span class="setup-detail-label">Important Updates</span>
+              <pre class="log-output log-output-compact">${esc(importantLines.join("\n") || "No important updates captured yet.")}</pre>
+            </div>
+          </div>
+        </div>
+      `,
+      commands: `
+        <div class="setup-detail-section">
+          <span class="setup-detail-label">Commands</span>
+          <p class="form-helper">Structured command tracking is easier to scan than the raw terminal. Running and failed commands surface here first.</p>
+          ${renderSetupCommands(commands)}
+        </div>
+      `,
+      files: `
+        <div class="setup-detail-section">
+          <span class="setup-detail-label">Files Changed</span>
+          <div class="setup-chip-list">${renderSetupChipList(run.changedFiles, "No changed files recorded")}</div>
+          <span class="setup-detail-label setup-detail-subsection">Out-of-Scope Edits</span>
+          <div class="setup-chip-list">${renderSetupChipList(run.violationFiles, "No out-of-scope file edits", "danger")}</div>
+          <span class="setup-detail-label setup-detail-subsection">Final Message</span>
+          <pre class="log-output log-output-compact">${esc(run.lastMessage || "No final message captured yet.")}</pre>
+        </div>
+      `,
+      diff: `
+        <div class="setup-detail-section">
+          <span class="setup-detail-label">Diff</span>
+          <pre class="log-output log-output-compact">${esc(run.diffExcerpt || "No diff captured yet.")}</pre>
+        </div>
+      `,
+      terminal: `
+        <div class="setup-detail-section">
+          <span class="setup-detail-label">Raw Terminal Output</span>
+          <p class="form-helper">This is the full raw stream from Codex and the setup commands. Use it for deep debugging after checking Overview and Commands first.</p>
+          <pre class="log-output" data-setup-terminal-output="1">${esc(consoleOutput)}</pre>
+        </div>
+      `,
+    };
 
     container.innerHTML = `
       <div class="setup-detail-grid">
@@ -901,8 +1383,7 @@
             <dt>Worktree</dt><dd><code>${esc(worktreePath)}</code></dd>
           </dl>
           <p class="setup-summary-text">${esc(run.summary || run.error || "No summary available yet.")}</p>
-          <div class="setup-chip-list">${renderSetupChipList(run.changedFiles, "No changed files recorded")}</div>
-          <div class="setup-chip-list">${renderSetupChipList(run.violationFiles, "No out-of-scope file edits", "danger")}</div>
+          ${renderSetupMetricCards(metrics.slice(0, 3))}
         </div>
         <div class="setup-detail-prompt">
           <strong>Configured Scope</strong>
@@ -926,20 +1407,20 @@
         </div>
       </div>
       <div class="setup-output-stack">
-        <div class="setup-detail-section">
-          <span class="setup-detail-label">Terminal Output</span>
-          <pre class="log-output" data-setup-terminal-output="1">${esc(consoleOutput)}</pre>
-        </div>
-        <div class="setup-detail-section">
-          <span class="setup-detail-label">Final Message</span>
-          <pre class="log-output log-output-compact">${esc(run.lastMessage || "No final message captured yet.")}</pre>
-        </div>
-        <div class="setup-detail-section">
-          <span class="setup-detail-label">Diff</span>
-          <pre class="log-output log-output-compact">${esc(run.diffExcerpt || "No diff captured yet.")}</pre>
-        </div>
+        ${renderSetupDetailTabs(activeTab)}
+        ${detailPanels[activeTab] || detailPanels.overview}
       </div>
     `;
+
+    $$("[data-setup-detail-tab]", container).forEach((button) => {
+      button.addEventListener("click", () => {
+        setupRunDetailState = {
+          runId: run.id,
+          tab: button.dataset.setupDetailTab || "overview",
+        };
+        renderSetupRunDetail(activeSetupRunDetail);
+      });
+    });
 
     const terminalOutput = $("[data-setup-terminal-output]", container);
     if (terminalOutput) {
@@ -1153,7 +1634,12 @@
   let acceptedPage = 0;
   const ACCEPTED_PER_PAGE = 10;
   let acceptedReviewFilter = "all";
+  let acceptedRepoFilter = "";
+  let acceptedDockerFilter = "all";
+  let acceptedSort = "merged_desc";
+  let acceptedDetailCandidateId = null;
   let acceptedTestRunPoller = null;
+  let acceptedTestReloadHandler = null;
   let acceptedCodexReviewPoller = null;
   let codexReviewReloadHandler = null;
   const activeAcceptedTestRuns = new Set();
@@ -1226,6 +1712,60 @@
     };
   }
 
+  function acceptedAnalysisState(details) {
+    const analysis = details?.analysis || {};
+    return {
+      relevantSourceFiles: Array.isArray(analysis.relevantSourceFiles) ? analysis.relevantSourceFiles : [],
+      relevantTestFiles: Array.isArray(analysis.relevantTestFiles) ? analysis.relevantTestFiles : [],
+      codeLinesChanged: Number(analysis.codeLinesChanged || 0),
+      touchedDirectories: Array.isArray(analysis.touchedDirectories) ? analysis.touchedDirectories : [],
+    };
+  }
+
+  function acceptedGeminiReviewState(details) {
+    const state = details?.geminiReview || {};
+    const issues = Array.isArray(state.issues) ? state.issues : [];
+    const issueMap = new Map();
+    issues.forEach((issue) => {
+      const key = `${issue.owner}/${issue.repo}#${issue.number}`;
+      issueMap.set(key, issue);
+    });
+    const normalizedStatus = ["accepted_by_gemini", "not_accepted_by_gemini", "mixed"].includes(state.status)
+      ? state.status
+      : (issues.every((issue) => issue?.status === "accepted_by_gemini")
+        ? "accepted_by_gemini"
+        : (issues.some((issue) => issue?.status === "accepted_by_gemini") ? "mixed" : "not_accepted_by_gemini"));
+    return {
+      status: issues.length ? normalizedStatus : "pending",
+      summary: typeof state.summary === "string" ? state.summary : "",
+      analyzedAt: typeof state.analyzedAt === "string" ? state.analyzedAt : null,
+      issues,
+      issueMap,
+    };
+  }
+
+  function acceptedGeminiBadge(review) {
+    if (!review || review.status === "pending") {
+      return '<span class="badge badge-info">Gemini Not Run</span>';
+    }
+    if (review.status === "accepted_by_gemini") {
+      return '<span class="badge badge-completed">Accepted By Gemini</span>';
+    }
+    if (review.status === "mixed") {
+      return '<span class="badge badge-warn">Mixed Gemini Review</span>';
+    }
+    return '<span class="badge badge-rejected">Not Accepted By Gemini</span>';
+  }
+
+  function acceptedGeminiIssueBadge(issueReview) {
+    if (!issueReview) {
+      return '<span class="badge badge-info">Gemini Pending</span>';
+    }
+    return issueReview.status === "accepted_by_gemini"
+      ? '<span class="badge badge-completed">Accepted By Gemini</span>'
+      : '<span class="badge badge-rejected">Not Accepted By Gemini</span>';
+  }
+
   function acceptedDockerfileSourceLabel(source) {
     return {
       source: "Source Dockerfile",
@@ -1270,6 +1810,12 @@
 
   function codexPrompt(task, round) {
     return (task?.prompts || []).find((item) => Number(item.round) === Number(round))?.prompt || "";
+  }
+
+  function codexLastCompletedRound(task) {
+    return (task?.rounds || [])
+      .filter((item) => item?.reviewDraft)
+      .reduce((maxRound, item) => Math.max(maxRound, Number(item.round) || 0), 0);
   }
 
   function codexTmux(task) {
@@ -1392,6 +1938,7 @@
   function renderCodexTaskPanel(row, task, activeReview) {
     const tmux = codexTmux(task);
     const currentRound = task?.currentRound || 1;
+    const lastCompletedRound = codexLastCompletedRound(task);
     const currentPrompt = task ? codexPrompt(task, currentRound) : "";
     const promptOne = task ? codexPrompt(task, 1) : "";
     const issueTitle = task?.issue?.title || "";
@@ -1414,7 +1961,7 @@
               <strong>Codex Task</strong>
               <span class="badge badge-warn">Not Started</span>
             </div>
-            <span class="accepted-review-meta">Generate Prompt 1 and Codex review drafts from the issue, actual PR context, worktrees, and tmux captures.</span>
+            <span class="accepted-review-meta">Generate or regenerate a Codex-rewritten Prompt 1 and Codex review drafts from the issue, actual PR context, worktrees, and tmux captures.</span>
           </div>
           <div class="codex-task-form codex-task-grid">
             <label class="form-group">
@@ -1478,7 +2025,9 @@
           </label>
         </div>
         <div class="accepted-card-actions">
-          <button type="button" class="btn btn-sm btn-info" data-start-codex-task="${row.id}">Save Task</button>
+          <button type="button" class="btn btn-sm btn-info" data-update-codex-task="${row.id}">Update Task Settings</button>
+          <button type="button" class="btn btn-sm btn-info" data-start-codex-task="${row.id}">Restart Task</button>
+          ${lastCompletedRound ? `<button type="button" class="btn btn-sm btn-info" data-reopen-codex-round="${row.id}">Reopen Last Iteration</button>` : ""}
         </div>
         <div class="codex-two-column">
           <div class="codex-info-card">
@@ -1564,6 +2113,7 @@ ${esc(tmux?.attachB || "")}</pre>
       clearInterval(acceptedCodexReviewPoller);
       acceptedCodexReviewPoller = null;
     }
+    codexReviewReloadHandler = null;
   }
 
   async function pollAcceptedCodexReviewStates(container) {
@@ -1686,6 +2236,47 @@ ${esc(tmux?.attachB || "")}</pre>
       });
     });
 
+    $$("[data-update-codex-task]", container).forEach((button) => {
+      button.addEventListener("click", async () => {
+        const candidateId = button.dataset.updateCodexTask;
+        const readField = (field) => $(`[data-codex-start-field="${candidateId}"][data-field="${field}"]`, container)?.value?.trim() || "";
+        button.disabled = true;
+        try {
+          await api(`/api/accepted/${candidateId}/codex-task/settings`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              hfiUuid: readField("hfiUuid"),
+              originalRepoPath: readField("originalRepoPath"),
+              worktreeAPath: readField("worktreeAPath"),
+              worktreeBPath: readField("worktreeBPath"),
+              testCommand: readField("testCommand") || undefined,
+            }),
+          });
+          await reloadHandler();
+        } catch (err) {
+          alert("Failed to update task settings: " + err.message);
+          button.disabled = false;
+        }
+      });
+    });
+
+    $$("[data-reopen-codex-round]", container).forEach((button) => {
+      button.addEventListener("click", async () => {
+        const candidateId = button.dataset.reopenCodexRound;
+        button.disabled = true;
+        try {
+          await api(`/api/accepted/${candidateId}/codex-task/reopen-last-round`, {
+            method: "POST",
+          });
+          await reloadHandler();
+        } catch (err) {
+          alert("Failed to reopen the last iteration: " + err.message);
+          button.disabled = false;
+        }
+      });
+    });
+
     $$("[data-run-codex-review]", container).forEach((button) => {
       button.addEventListener("click", async () => {
         const candidateId = button.dataset.runCodexReview;
@@ -1798,6 +2389,7 @@ ${esc(tmux?.attachB || "")}</pre>
       clearInterval(acceptedTestRunPoller);
       acceptedTestRunPoller = null;
     }
+    acceptedTestReloadHandler = null;
   }
 
   async function pollAcceptedTestRunStates(container) {
@@ -1825,7 +2417,9 @@ ${esc(tmux?.attachB || "")}</pre>
       }
 
       if (shouldReload) {
-        await loadAccepted();
+        if (typeof acceptedTestReloadHandler === "function") {
+          await acceptedTestReloadHandler();
+        }
         return;
       }
 
@@ -1837,7 +2431,8 @@ ${esc(tmux?.attachB || "")}</pre>
     }
   }
 
-  function ensureAcceptedTestRunPolling(container) {
+  function ensureAcceptedTestRunPolling(container, reloadHandler) {
+    acceptedTestReloadHandler = reloadHandler;
     if (!activeAcceptedTestRuns.size || acceptedTestRunPoller) return;
     acceptedTestRunPoller = setInterval(() => {
       void pollAcceptedTestRunStates(container);
@@ -1947,568 +2542,330 @@ ${esc(tmux?.attachB || "")}</pre>
     return `<span class="badge ${badgeClass}">${reviewStatusLabel(status)}</span>`;
   }
 
-  function renderAcceptedIssues(issues) {
+  function renderAcceptedIssues(issues, opts = {}) {
     if (!Array.isArray(issues) || issues.length === 0) {
       return `<p class="accepted-empty">No verified issues saved for this PR.</p>`;
     }
+    const geminiReview = opts.geminiReview || acceptedGeminiReviewState({});
     return `
       <div class="accepted-issue-list">
         ${issues.map((issue) => `
-          <a href="${esc(issue.url || "#")}" target="_blank" class="accepted-issue-item">
-            <strong>${esc(issue.issue_repo_full_name || `${issue.owner}/${issue.repo}`)}</strong>
-            <span>#${issue.number}</span>
+          <div class="accepted-issue-item">
+            <div class="accepted-issue-item-header">
+              <a href="${esc(issue.url || "#")}" target="_blank" class="repo-link">
+                <strong>${esc(issue.issue_repo_full_name || `${issue.owner}/${issue.repo}`)}</strong>
+                <span>#${issue.number}</span>
+              </a>
+              ${acceptedGeminiIssueBadge(geminiReview.issueMap.get(`${issue.owner}/${issue.repo}#${issue.number}`))}
+            </div>
             <span>${esc(issue.title || "Untitled issue")}</span>
-          </a>
+            ${geminiReview.issueMap.get(`${issue.owner}/${issue.repo}#${issue.number}`)?.reasoning
+              ? `<p class="accepted-issue-note">${esc(geminiReview.issueMap.get(`${issue.owner}/${issue.repo}#${issue.number}`).reasoning)}</p>`
+              : ""}
+          </div>
         `).join("")}
       </div>
     `;
   }
 
+  function acceptedSortParams() {
+    const [sortBy = "merged", sortDir = "desc"] = String(acceptedSort || "merged_desc").split("_");
+    return {
+      sortBy,
+      sortDir: sortDir === "asc" ? "asc" : "desc",
+    };
+  }
+
+  function populateAcceptedRepoFilter(options = []) {
+    const select = $("#accepted-repo-filter");
+    if (!select) return;
+    const currentValue = acceptedRepoFilter;
+    const currentLabel = select.selectedOptions?.[0]?.textContent?.trim() || "";
+    select.innerHTML = `
+      <option value="">All Repositories</option>
+      ${(Array.isArray(options) ? options : []).map((option) => `
+        <option value="${option.id}" ${String(option.id) === String(currentValue) ? "selected" : ""}>
+          ${esc(option.full_name)} (${option.candidate_count})
+        </option>
+      `).join("")}
+    `;
+    if (currentValue && (!Array.isArray(options) || !options.some((option) => String(option.id) === String(currentValue)))) {
+      select.innerHTML += `<option value="${esc(currentValue)}" selected>${esc(currentLabel || `Selected Repo (${currentValue})`)}</option>`;
+    }
+    select.value = currentValue || "";
+  }
+
+  function renderAcceptedSummary(total, rows) {
+    renderTableSummary("#accepted-summary", total, ACCEPTED_PER_PAGE, acceptedPage);
+    const summary = $("#accepted-summary");
+    if (!summary || !total) return;
+    const repoCount = new Set((Array.isArray(rows) ? rows : []).map((row) => String(row.repo_id))).size;
+    summary.innerHTML += `<span class="summary-right">${repoCount} repo${repoCount === 1 ? "" : "s"} on this page</span>`;
+  }
+
+  function renderAcceptedToolbarHint(rows = []) {
+    const hint = $("#accepted-toolbar-hint");
+    if (!hint) return;
+    const repoLabel = acceptedRepoFilter
+      ? rows.find((row) => String(row.repo_id) === String(acceptedRepoFilter))?.repo_full_name
+        || $("#accepted-repo-filter")?.selectedOptions?.[0]?.textContent?.replace(/\s+\(\d+\)$/, "")
+      : "";
+    const bits = [];
+    if (repoLabel) {
+      bits.push(`Focused on ${repoLabel}.`);
+    }
+    if (acceptedReviewFilter !== "all") {
+      bits.push(`Review filter: ${reviewStatusLabel(acceptedReviewFilter)}.`);
+    }
+    if (acceptedDockerFilter !== "all") {
+      bits.push(`Docker filter: ${acceptedDockerFilter.replace(/_/g, " ")}.`);
+    }
+    bits.push("Repository groups stay alphabetical so the table is easy to scan.");
+    bits.push("Sort changes the order inside each repository group.");
+    hint.textContent = bits.join(" ");
+  }
+
+  function renderAcceptedTable(rows) {
+    const groups = [];
+    for (const row of rows) {
+      const last = groups[groups.length - 1];
+      if (!last || last.repoId !== Number(row.repo_id)) {
+        groups.push({
+          repoId: Number(row.repo_id),
+          repoFullName: row.repo_full_name,
+          repoUrl: row.repo_url,
+          repoLanguage: row.repo_primary_language,
+          rows: [row],
+        });
+      } else {
+        last.rows.push(row);
+      }
+    }
+
+    return groups.map((group) => {
+      const issueTotal = group.rows.reduce((sum, row) => sum + (Number(row.issue_count) || (Array.isArray(row.issues) ? row.issues.length : 0)), 0);
+      return `
+        <tr class="accepted-group-row">
+          <td colspan="11">
+            <div class="accepted-group-cell">
+              <div class="accepted-group-main">
+                <button type="button" class="accepted-group-link" data-filter-accepted-repo="${group.repoId}">
+                  ${esc(group.repoFullName)}
+                </button>
+                <div class="accepted-group-meta">
+                  <span>${group.rows.length} accepted PR${group.rows.length === 1 ? "" : "s"}</span>
+                  <span>${issueTotal} linked issue${issueTotal === 1 ? "" : "s"}</span>
+                  <span>${esc(group.repoLanguage || "Language unknown")}</span>
+                </div>
+              </div>
+              <div class="accepted-group-actions">
+                <a href="${esc(group.repoUrl || "#")}" target="_blank" class="repo-link-external">Open Repo</a>
+                <button type="button" class="btn btn-sm" data-filter-accepted-repo="${group.repoId}">
+                  ${String(group.repoId) === String(acceptedRepoFilter) ? "Focused Repo" : "Focus Repo"}
+                </button>
+                <button type="button" class="btn btn-sm btn-danger" data-reject-accepted-repo="${group.repoId}" data-reject-accepted-repo-name="${esc(group.repoFullName)}">
+                  Reject Repo
+                </button>
+              </div>
+            </div>
+          </td>
+        </tr>
+        ${group.rows.map((row) => {
+          const details = row.details || {};
+          const review = reviewQueueState(details);
+          const usage = manualReproUsage(details);
+          const manualReview = manualReviewState(details);
+          const dockerTest = acceptedDockerTestState(details);
+          const analysis = acceptedAnalysisState(details);
+          const geminiReview = acceptedGeminiReviewState(details);
+          const issueCount = Number(row.issue_count) || (Array.isArray(row.issues) ? row.issues.length : 0);
+          const setupButtonLabel = Array.isArray(row.issues) && row.issues.length === 1 ? "Setup Issue" : "Setup Repo";
+          return `
+            <tr>
+              <td>
+                <button type="button" class="accepted-table-link" data-open-accepted-detail="${row.id}">
+                  PR #${row.pr_number || "—"}
+                </button>
+              </td>
+              <td>
+                <button type="button" class="accepted-table-link accepted-title-link" data-open-accepted-detail="${row.id}">
+                  ${esc(row.pr_title || "No PR title saved")}
+                </button>
+                ${manualReview.rejected ? '<span class="badge badge-rejected accepted-inline-badge">Manual Reject</span>' : ""}
+              </td>
+              <td>${issueCount}</td>
+              <td>${analysis.relevantSourceFiles.length}</td>
+              <td>${analysis.codeLinesChanged}</td>
+              <td>${acceptedGeminiBadge(geminiReview)}</td>
+              <td>${reviewStatusBadge(review.status)}</td>
+              <td>${acceptedDockerRunBadge(row.activeTestRun || null, dockerTest)}</td>
+              <td><span class="badge ${usage.used ? "badge-completed" : "badge-warn"}">${usage.used ? "Used" : "Unused"}</span></td>
+              <td>${fmtDate(row.pr_merged_at || row.created_at)}</td>
+              <td>
+                <div class="accepted-table-actions">
+                  <button type="button" class="btn btn-sm btn-info" data-open-accepted-detail="${row.id}">Details</button>
+                  <button type="button" class="btn btn-sm" data-setup-accepted="${row.id}">${setupButtonLabel}</button>
+                  <button type="button" class="btn btn-sm" data-open-task-workspace="${row.id}">Task</button>
+                  <button type="button" class="btn btn-sm btn-danger" data-manual-reject-row="${row.id}">Reject Issue</button>
+                </div>
+              </td>
+            </tr>
+          `;
+        }).join("")}
+      `;
+    }).join("");
+  }
+
+  function bindAcceptedListInteractions(container, rows) {
+    $$("[data-open-accepted-detail]", container).forEach((button) => {
+      button.addEventListener("click", () => openAcceptedDetail(button.dataset.openAcceptedDetail));
+    });
+
+    $$("[data-open-task-workspace]", container).forEach((button) => {
+      button.addEventListener("click", () => openTaskWorkspace(button.dataset.openTaskWorkspace));
+    });
+
+    $$("[data-setup-accepted]", container).forEach((button) => {
+      button.addEventListener("click", () => {
+        const candidateId = Number(button.dataset.setupAccepted);
+        const row = rows.find((item) => Number(item.id) === candidateId);
+        if (!row) return;
+        prepareAcceptedSetup(row);
+      });
+    });
+
+    $$("[data-manual-reject-row]", container).forEach((button) => {
+      button.addEventListener("click", async () => {
+        const candidateId = button.dataset.manualRejectRow;
+        if (!confirm("Reject this accepted issue and remove the PR from the accepted queue?")) return;
+        button.disabled = true;
+        try {
+          await api(`/api/accepted/${candidateId}/manual-reject`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+          });
+          showToast("Accepted issue rejected.", "success");
+          await loadAccepted();
+          await loadDashboard();
+        } catch (err) {
+          showToast(`Failed to reject issue: ${err.message}`, "error");
+          button.disabled = false;
+        }
+      });
+    });
+
+    $$("[data-filter-accepted-repo]", container).forEach((button) => {
+      button.addEventListener("click", () => {
+        acceptedRepoFilter = String(button.dataset.filterAcceptedRepo || "");
+        acceptedPage = 0;
+        if ($("#accepted-repo-filter")) {
+          $("#accepted-repo-filter").value = acceptedRepoFilter;
+        }
+        void loadAccepted();
+      });
+    });
+
+    $$("[data-reject-accepted-repo]", container).forEach((button) => {
+      button.addEventListener("click", async () => {
+        const repoId = button.dataset.rejectAcceptedRepo;
+        const repoName = button.dataset.rejectAcceptedRepoName || "this repo";
+        if (!confirm(`Reject all currently accepted items from ${repoName}?`)) return;
+        button.disabled = true;
+        try {
+          const result = await api(`/api/accepted/repo/${repoId}/manual-reject`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+          });
+          showToast(`Rejected ${result.rejectedCount} accepted item(s) from ${result.repoFullName || repoName}.`, "success");
+          await loadAccepted();
+          await loadDashboard();
+        } catch (err) {
+          showToast(`Failed to reject repo: ${err.message}`, "error");
+          button.disabled = false;
+        }
+      });
+    });
+
+    $$("[data-clear-accepted-empty]", container).forEach((button) => {
+      button.addEventListener("click", () => {
+        acceptedSearchQuery = "";
+        acceptedRepoFilter = "";
+        acceptedReviewFilter = "all";
+        acceptedDockerFilter = "all";
+        acceptedSort = "merged_desc";
+        acceptedPage = 0;
+        syncAcceptedFilterControls();
+        void loadAccepted();
+      });
+    });
+  }
+
+  function syncAcceptedFilterControls() {
+    if ($("#accepted-search")) $("#accepted-search").value = acceptedSearchQuery;
+    if ($("#accepted-repo-filter")) $("#accepted-repo-filter").value = acceptedRepoFilter;
+    if ($("#accepted-review-filter")) $("#accepted-review-filter").value = acceptedReviewFilter;
+    if ($("#accepted-docker-filter")) $("#accepted-docker-filter").value = acceptedDockerFilter;
+    if ($("#accepted-sort")) $("#accepted-sort").value = acceptedSort;
+  }
+
   async function loadAccepted() {
-    const container = $("#accepted-list");
+    const container = $("#accepted-tbody");
     stopAcceptedTestRunPolling();
     stopAcceptedCodexReviewPolling();
     activeAcceptedTestRuns.clear();
     activeAcceptedCodexReviews.clear();
+    syncAcceptedFilterControls();
+
     try {
+      const { sortBy, sortDir } = acceptedSortParams();
       const params = new URLSearchParams({
         limit: ACCEPTED_PER_PAGE,
         offset: acceptedPage * ACCEPTED_PER_PAGE,
         reviewStatus: acceptedReviewFilter,
+        dockerStatus: acceptedDockerFilter,
+        sortBy,
+        sortDir,
       });
+      if (acceptedRepoFilter) params.set("repoId", acceptedRepoFilter);
+      if (acceptedSearchQuery) params.set("search", acceptedSearchQuery);
+
       const data = await api(`/api/accepted?${params.toString()}`);
-      if (!data.rows.length) {
-        container.innerHTML = `<div class="card"><div class="empty-state"><div class="empty-icon">✅</div><p>No accepted pull requests yet.</p></div></div>`;
+      const rows = Array.isArray(data.rows) ? data.rows : [];
+      populateAcceptedRepoFilter(data.repoOptions);
+      renderAcceptedToolbarHint(rows);
+
+      if (!rows.length) {
+        renderAcceptedSummary(0, []);
+        container.innerHTML = `
+          <tr>
+            <td colspan="11">
+              <div class="empty-state">
+                <div class="empty-icon">✅</div>
+                <p>No accepted pull requests match the current filters.</p>
+                <button type="button" class="btn btn-sm" data-clear-accepted-empty>Clear Filters</button>
+              </div>
+            </td>
+          </tr>
+        `;
         $("#accepted-pagination").innerHTML = "";
+        bindAcceptedListInteractions(container, rows);
         return;
       }
 
-      const reviewOrder = { new: 0, reviewing: 1, follow_up: 2, approved: 3 };
-      const rows = [...data.rows].sort((left, right) => {
-        const leftReview = reviewQueueState(left.details);
-        const rightReview = reviewQueueState(right.details);
-        return (reviewOrder[leftReview.status] ?? 0) - (reviewOrder[rightReview.status] ?? 0);
-      });
-
-      container.innerHTML = rows.map((row) => {
-        const details = row.details || {};
-        const codexTask = codexTaskState(details);
-        const usage = manualReproUsage(details);
-        const review = reviewQueueState(details);
-        const manualReview = manualReviewState(details);
-        const dockerTest = acceptedDockerTestState(details);
-        const activeTestRun = row.activeTestRun || null;
-        const activeCodexReview = row.activeCodexReview || null;
-        if (activeTestRun?.status === "running") {
-          expandedAcceptedRows.add(String(row.id));
-        }
-        if (activeCodexReview?.status === "running") {
-          expandedAcceptedRows.add(String(row.id));
-        }
-        const expanded = expandedAcceptedRows.has(String(row.id));
-        const reasons = Array.isArray(row.rejection_reasons) ? row.rejection_reasons : [];
-        const manualRepro = buildManualReproText({
-          repoFullName: row.repo_full_name,
-          repoUrl: row.repo_url,
-          prNumber: row.pr_number,
-          prUrl: row.pr_url,
-          preFixSha: row.pre_fix_sha,
-          details,
-        });
-        const lastTestCommand = Array.isArray(dockerTest.lastRun.testCommand) && dockerTest.lastRun.testCommand.length
-          ? shellJoin(dockerTest.lastRun.testCommand)
-          : "";
-        const dockerfileReasoning = dockerTest.dockerfile.reasoningSummary
-          ? `<p class="dockerfile-editor-note" data-accepted-dockerfile-reasoning="${row.id}">${esc(dockerTest.dockerfile.reasoningSummary)}</p>`
-          : `<p class="dockerfile-editor-note" data-accepted-dockerfile-reasoning="${row.id}" hidden></p>`;
-        const setupButtonLabel = Array.isArray(row.issues) && row.issues.length === 1 ? "Setup Issue" : "Setup Repo";
-
-        return `
-          <div class="card accepted-card">
-            <div class="accepted-card-header accepted-card-header-compact">
-              <div class="accepted-card-summary">
-                <div class="accepted-card-summary-main">
-                  <strong>${esc(row.repo_full_name)}</strong>
-                  <a href="${esc(row.pr_url || "#")}" target="_blank" class="repo-link">PR #${row.pr_number || "—"}</a>
-                  ${reviewStatusBadge(review.status)}
-                  ${acceptedDockerRunBadge(activeTestRun, dockerTest)}
-                  <span class="badge ${usage.used ? "badge-completed" : "badge-warn"}">${usage.used ? "Manual Repro Used" : "Manual Repro Unused"}</span>
-                  ${manualReview.rejected ? '<span class="badge badge-rejected">Manual Reject</span>' : ""}
-                </div>
-                <div class="accepted-card-summary-sub">
-                  <span>${row.pr_title ? esc(row.pr_title) : "No PR title saved"}</span>
-                  <span>${Array.isArray(row.issues) ? row.issues.length : 0} issue${Array.isArray(row.issues) && row.issues.length === 1 ? "" : "s"}</span>
-                  <span>${dockerTest.dockerfile.path ? `Dockerfile: ${esc(dockerTest.dockerfile.path)}` : "Dockerfile: —"}</span>
-                  <span>${activeTestRun?.status === "running"
-                    ? "Docker tests running"
-                    : (dockerTest.lastRun.finishedAt
-                      ? `${dockerTest.lastRun.success ? "Docker tests passed" : "Docker tests failed"} ${fmtDate(dockerTest.lastRun.finishedAt)}`
-                      : "Docker tests not run")}</span>
-                </div>
-              </div>
-              <div class="accepted-card-actions">
-                <button type="button" class="btn btn-sm" data-setup-accepted="${row.id}">${setupButtonLabel}</button>
-                <button type="button" class="btn btn-sm btn-info" data-deep-scan-accepted="${esc(row.repo_full_name)}">Deep Scan Repo</button>
-                <button type="button" class="btn btn-sm btn-info" data-open-task-workspace="${row.id}">Open Task</button>
-                <button type="button" class="btn btn-sm" data-toggle-accepted-details="${row.id}" aria-expanded="${expanded ? "true" : "false"}">${expanded ? "Hide Details" : "View Details"}</button>
-              </div>
-            </div>
-            <div class="accepted-card-body" data-accepted-details="${row.id}" ${expanded ? "" : "hidden"}>
-              <div class="accepted-card-header">
-                <div class="accepted-card-title">
-                  <span class="badge badge-accepted">Accepted</span>
-                  <span class="badge badge-info">Scan #${row.scan_id}</span>
-                  <span class="badge badge-info">${esc(acceptedDockerfileSourceLabel(dockerTest.dockerfile.source))}</span>
-                </div>
-                <div class="accepted-card-actions">
-                  <button type="button" class="btn btn-sm" data-toggle-manual-repro-used="${row.id}" data-used="${usage.used ? "1" : "0"}">${usage.used ? "Mark Unused" : "Mark Used"}</button>
-                  <button type="button" class="btn btn-sm btn-danger" data-manual-reject="${row.id}" ${manualReview.rejected ? "disabled" : ""}>${manualReview.rejected ? "Marked Rejected" : "Reject"}</button>
-                </div>
-              </div>
-            ${row.pr_title ? `<p class="accepted-pr-title">${esc(row.pr_title)}</p>` : ""}
-            <dl class="detail-kv accepted-meta">
-              <dt>Repo</dt><dd><a href="${esc(row.repo_url || "#")}" target="_blank" class="repo-link">${esc(row.repo_full_name)}</a></dd>
-              <dt>PR</dt><dd>${row.pr_number ? `<a href="${esc(row.pr_url || "#")}" target="_blank" class="repo-link">#${row.pr_number}</a>` : "—"}</dd>
-              <dt>Issue Count</dt><dd>${Array.isArray(row.issues) ? row.issues.length : 0}</dd>
-              <dt>Manual Repro</dt><dd>${usage.used ? `Used ${fmtDate(usage.usedAt)}` : "Not used yet"}</dd>
-              <dt>Manual Review</dt><dd>${manualReview.rejected ? `Rejected ${fmtDate(manualReview.rejectedAt)}` : "Not manually rejected"}</dd>
-            </dl>
-            <div class="detail-section">
-              <h4>Issues</h4>
-              ${renderAcceptedIssues(row.issues)}
-            </div>
-            <div class="accepted-review-panel">
-              <div class="accepted-review-header">
-                <strong>Review Queue</strong>
-                <span class="accepted-review-meta">${review.updatedAt ? `Updated ${fmtDate(review.updatedAt)}` : "Not reviewed yet"}</span>
-              </div>
-              <div class="accepted-review-controls">
-                <select class="accepted-review-select" data-review-status="${row.id}">
-                  <option value="new" ${review.status === "new" ? "selected" : ""}>New</option>
-                  <option value="reviewing" ${review.status === "reviewing" ? "selected" : ""}>Reviewing</option>
-                  <option value="approved" ${review.status === "approved" ? "selected" : ""}>Approved</option>
-                  <option value="follow_up" ${review.status === "follow_up" ? "selected" : ""}>Follow Up</option>
-                </select>
-                <textarea class="accepted-review-notes" data-review-notes="${row.id}" placeholder="Add manual review notes...">${esc(review.notes)}</textarea>
-                <div class="accepted-card-actions">
-                  <button type="button" class="btn btn-sm btn-info" data-save-review="${row.id}">Save Review</button>
-                </div>
-              </div>
-            </div>
-            <div class="accepted-review-panel accepted-test-panel">
-              <div class="accepted-review-header">
-                <div class="accepted-card-title">
-                  <strong>Docker Test Run</strong>
-                  ${acceptedDockerRunBadge(activeTestRun, dockerTest)}
-                  <span class="badge badge-info">${esc(acceptedDockerfileSourceLabel(dockerTest.dockerfile.source))}</span>
-                </div>
-                <span class="accepted-review-meta">
-                  ${dockerTest.lastRun.finishedAt
-                    ? `${dockerTest.lastRun.success ? "Passed" : "Failed"} ${fmtDate(dockerTest.lastRun.finishedAt)}`
-                    : "Not run yet"}
-                </span>
-              </div>
-              <div class="accepted-test-summary">
-                <p><strong>Dockerfile:</strong> <code>${esc(dockerTest.dockerfile.path)}</code>${dockerTest.dockerfile.sha256 ? ` (${esc(dockerTest.dockerfile.sha256.slice(0, 12))})` : ""}</p>
-                <p><strong>Updated:</strong> ${dockerTest.dockerfile.updatedAt ? fmtDate(dockerTest.dockerfile.updatedAt) : "Not generated yet"}</p>
-                <p><strong>Last Result:</strong> ${esc(dockerTest.lastRun.summary || "No Docker test run has been recorded yet.")}</p>
-                ${lastTestCommand ? `<p><strong>Last Test Command:</strong> <code>${esc(lastTestCommand)}</code></p>` : ""}
-              </div>
-              <div class="accepted-card-actions accepted-test-actions">
-                <button type="button" class="btn btn-sm" data-toggle-accepted-dockerfile="${row.id}">Edit Dockerfile</button>
-                <button type="button" class="btn btn-sm btn-info" data-generate-accepted-dockerfile="${row.id}">Gemini Test Dockerfile</button>
-                <button type="button" class="btn btn-sm btn-info" data-run-accepted-tests="${row.id}">Run Tests</button>
-                <button type="button" class="btn btn-sm btn-danger" data-stop-accepted-tests="${row.id}" hidden>Stop</button>
-                <button type="button" class="btn btn-sm" data-fix-accepted-dockerfile="${row.id}" ${dockerTest.lastRun.finishedAt && !dockerTest.lastRun.success ? "" : "disabled"}>Fix With Gemini</button>
-              </div>
-              <div class="tests-unable-editor accepted-dockerfile-editor" data-accepted-dockerfile-editor="${row.id}" data-loaded="${dockerTest.dockerfile.reasoningSummary || dockerTest.dockerfile.updatedAt ? "true" : "false"}" data-dockerfile-source="${esc(dockerTest.dockerfile.source)}" data-reasoning-summary="${esc(dockerTest.dockerfile.reasoningSummary)}" hidden>
-                <div class="tests-unable-editor-header">
-                  <div class="form-group" style="margin:0; flex:1;">
-                    <label>Dockerfile Path</label>
-                    <input type="text" data-accepted-dockerfile-path="${row.id}" value="${esc(dockerTest.dockerfile.path)}" placeholder="Dockerfile" spellcheck="false">
-                  </div>
-                  <button type="button" class="btn btn-sm" data-load-accepted-dockerfile="${row.id}">Reload</button>
-                </div>
-                <p class="dockerfile-editor-note" data-accepted-dockerfile-status="${row.id}">Load or generate the Dockerfile you want to use for the manual Docker test run.</p>
-                <div data-accepted-dockerfile-choices="${row.id}"></div>
-                ${dockerfileReasoning}
-                <textarea class="dockerfile-editor-input" data-accepted-dockerfile-content="${row.id}" spellcheck="false" placeholder="Dockerfile content will appear here after loading.">${esc(typeof details?.acceptedTest?.dockerfile?.content === "string" ? details.acceptedTest.dockerfile.content : "")}</textarea>
-              </div>
-              <div class="tests-unable-rerun-panel accepted-test-run-panel" data-accepted-test-panel="${row.id}" hidden>
-                <div class="tests-unable-rerun-meta">
-                  <span class="badge badge-running" data-accepted-test-status-badge="${row.id}">running</span>
-                  <span class="tests-unable-rerun-stage" data-accepted-test-stage="${row.id}">Starting Docker test run…</span>
-                </div>
-                <pre class="log-output log-output-compact tests-unable-live-output" data-accepted-test-output="${row.id}">Waiting for Docker output…</pre>
-              </div>
-              ${row.logFiles?.length ? row.logFiles.map((log) => `
-                <details class="accepted-log-details">
-                  <summary>${esc(log.label)}</summary>
-                  <pre class="log-output log-output-compact">${esc(log.excerpt)}</pre>
-                </details>
-              `).join("") : ""}
-            </div>
-            ${manualReview.rejected ? `<p class="accepted-reasons">${esc(manualReview.reason || "manually rejected by user")}</p>` : ""}
-            ${reasons.length ? `<p class="accepted-reasons">${esc(reasons.join(" · "))}</p>` : ""}
-            ${renderCodexTaskSummary(row, codexTask, activeCodexReview)}
-            ${manualRepro ? renderManualReproBlock(`accepted-${row.id}`, manualRepro) : ""}
-            </div>
-          </div>
-        `;
-      }).join("");
-
-      attachManualReproCopyHandlers(container);
-
-      bindCodexTaskInteractions(container, loadAccepted);
-      $$("[data-open-task-workspace]", container).forEach((button) => {
-        button.addEventListener("click", () => openTaskWorkspace(button.dataset.openTaskWorkspace));
-      });
-
-      $$("[data-toggle-manual-repro-used]", container).forEach((button) => {
-        button.addEventListener("click", async () => {
-          const candidateId = button.dataset.toggleManualReproUsed;
-          const nextUsed = button.dataset.used !== "1";
-          button.disabled = true;
-          try {
-            await api(`/api/candidates/${candidateId}/manual-repro-usage`, {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ used: nextUsed }),
-            });
-            await loadAccepted();
-          } catch (err) {
-            alert("Failed to update manual repro usage: " + err.message);
-            button.disabled = false;
-          }
-        });
-      });
-
-      $$("[data-manual-reject]", container).forEach((button) => {
-        button.addEventListener("click", async () => {
-          const candidateId = button.dataset.manualReject;
-          if (!confirm("Mark this accepted candidate as manually rejected?")) return;
-          button.disabled = true;
-          try {
-            await api(`/api/accepted/${candidateId}/manual-reject`, {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-            });
-            await loadAccepted();
-            await loadDashboard();
-          } catch (err) {
-            alert("Failed to reject candidate: " + err.message);
-            button.disabled = false;
-          }
-        });
-      });
-
-      $$("[data-save-review]", container).forEach((button) => {
-        button.addEventListener("click", async () => {
-          const candidateId = button.dataset.saveReview;
-          const statusInput = $(`[data-review-status="${candidateId}"]`, container);
-          const notesInput = $(`[data-review-notes="${candidateId}"]`, container);
-          button.disabled = true;
-          try {
-            await api(`/api/candidates/${candidateId}/review`, {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({
-                status: statusInput?.value || "new",
-                notes: notesInput?.value || "",
-              }),
-            });
-            await loadAccepted();
-          } catch (err) {
-            alert("Failed to save review: " + err.message);
-            button.disabled = false;
-          }
-        });
-      });
-
-      $$("[data-deep-scan-accepted]", container).forEach((button) => {
-        button.addEventListener("click", () => {
-          prepareSingleRepoDeepScan(button.dataset.deepScanAccepted);
-        });
-      });
-
-      $$("[data-setup-accepted]", container).forEach((button) => {
-        button.addEventListener("click", () => {
-          const candidateId = Number(button.dataset.setupAccepted);
-          const row = rows.find((item) => Number(item.id) === candidateId);
-          if (!row) return;
-          prepareAcceptedSetup(row);
-        });
-      });
-
-      $$("[data-toggle-accepted-details]", container).forEach((button) => {
-        button.addEventListener("click", () => {
-          const candidateId = button.dataset.toggleAcceptedDetails;
-          const detailsPanel = $(`[data-accepted-details="${candidateId}"]`, container);
-          if (!candidateId || !detailsPanel) return;
-          const nextExpanded = detailsPanel.hidden;
-          detailsPanel.hidden = !nextExpanded;
-          if (nextExpanded) {
-            expandedAcceptedRows.add(String(candidateId));
-          } else {
-            expandedAcceptedRows.delete(String(candidateId));
-          }
-          button.textContent = nextExpanded ? "Hide Details" : "View Details";
-          button.setAttribute("aria-expanded", nextExpanded ? "true" : "false");
-        });
-      });
-
-      $$("[data-toggle-accepted-dockerfile]", container).forEach((button) => {
-        button.addEventListener("click", async () => {
-          const candidateId = button.dataset.toggleAcceptedDockerfile;
-          const editor = $(`[data-accepted-dockerfile-editor="${candidateId}"]`, container);
-          if (!editor) return;
-          if (editor.hidden) {
-            if (editor.dataset.loaded === "true") {
-              editor.hidden = false;
-              button.textContent = "Hide Dockerfile";
-              return;
-            }
-            try {
-              await loadAcceptedDockerfileEditor(container, candidateId, undefined);
-            } catch (err) {
-              alert("Failed to load Dockerfile: " + err.message);
-            }
-            return;
-          }
-          editor.hidden = true;
-          button.textContent = "Edit Dockerfile";
-        });
-      });
-
-      $$("[data-load-accepted-dockerfile]", container).forEach((button) => {
-        button.addEventListener("click", async () => {
-          const candidateId = button.dataset.loadAcceptedDockerfile;
-          const pathInput = $(`[data-accepted-dockerfile-path="${candidateId}"]`, container);
-          try {
-            await loadAcceptedDockerfileEditor(container, candidateId, pathInput?.value);
-          } catch (err) {
-            alert("Failed to load Dockerfile: " + err.message);
-          }
-        });
-      });
-
-      $$("[data-generate-accepted-dockerfile]", container).forEach((button) => {
-        button.addEventListener("click", async () => {
-          const candidateId = button.dataset.generateAcceptedDockerfile;
-          const editor = $(`[data-accepted-dockerfile-editor="${candidateId}"]`, container);
-          const pathInput = $(`[data-accepted-dockerfile-path="${candidateId}"]`, container);
-          const contentInput = $(`[data-accepted-dockerfile-content="${candidateId}"]`, container);
-          const status = $(`[data-accepted-dockerfile-status="${candidateId}"]`, container);
-          const choices = $(`[data-accepted-dockerfile-choices="${candidateId}"]`, container);
-          const reasoning = $(`[data-accepted-dockerfile-reasoning="${candidateId}"]`, container);
-          button.disabled = true;
-          button.textContent = "Generating…";
-          try {
-            const data = await api(`/api/accepted/${candidateId}/generate-test-dockerfile`, {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({
-                dockerfilePath: pathInput?.value?.trim() || undefined,
-              }),
-            });
-            if (editor) {
-              editor.hidden = false;
-              editor.dataset.loaded = "true";
-              editor.dataset.dockerfileSource = data.source || "gemini";
-              editor.dataset.reasoningSummary = data.reasoningSummary || "";
-            }
-            if (pathInput) pathInput.value = data.path || (pathInput?.value || "Dockerfile");
-            if (contentInput) contentInput.value = data.content || "";
-            if (status) {
-              status.innerHTML = `Gemini generated <code>${esc(data.path || "Dockerfile")}</code> for running tests in Docker. Review it, then run tests.`;
-            }
-            if (choices) {
-              choices.innerHTML = renderAcceptedDockerfileChoices(candidateId, data.availablePaths, data.path || pathInput?.value || "Dockerfile");
-              $$(`[data-accepted-dockerfile-choice="${candidateId}"]`, container).forEach((choice) => {
-                choice.addEventListener("click", async () => {
-                  const nextPath = choice.dataset.acceptedDockerfileChoicePath || "";
-                  try {
-                    await loadAcceptedDockerfileEditor(container, candidateId, nextPath);
-                  } catch (err) {
-                    alert("Failed to load Dockerfile: " + err.message);
-                  }
-                });
-              });
-            }
-            if (reasoning) {
-              reasoning.hidden = !data.reasoningSummary;
-              reasoning.textContent = data.reasoningSummary || "";
-            }
-            const toggleButton = $(`[data-toggle-accepted-dockerfile="${candidateId}"]`, container);
-            if (toggleButton) {
-              toggleButton.textContent = "Hide Dockerfile";
-            }
-            const fixButton = $(`[data-fix-accepted-dockerfile="${candidateId}"]`, container);
-            if (fixButton) {
-              fixButton.disabled = true;
-            }
-          } catch (err) {
-            alert("Failed to generate Dockerfile with Gemini: " + err.message);
-          } finally {
-            button.disabled = false;
-            button.textContent = "Gemini Test Dockerfile";
-          }
-        });
-      });
-
-      $$("[data-run-accepted-tests]", container).forEach((button) => {
-        button.addEventListener("click", async () => {
-          const candidateId = button.dataset.runAcceptedTests;
-          const editor = $(`[data-accepted-dockerfile-editor="${candidateId}"]`, container);
-          const pathInput = $(`[data-accepted-dockerfile-path="${candidateId}"]`, container);
-          const contentInput = $(`[data-accepted-dockerfile-content="${candidateId}"]`, container);
-          const reasoning = $(`[data-accepted-dockerfile-reasoning="${candidateId}"]`, container);
-
-          try {
-            if (editor?.dataset.loaded !== "true") {
-              await loadAcceptedDockerfileEditor(container, candidateId, pathInput?.value);
-            }
-          } catch (err) {
-            alert("Failed to load Dockerfile before running tests: " + err.message);
-            return;
-          }
-
-          const dockerfilePath = pathInput?.value?.trim();
-          const dockerfileContent = contentInput?.value || "";
-          if (!dockerfilePath || !dockerfileContent.trim()) {
-            alert("Load or generate a Dockerfile before running tests.");
-            return;
-          }
-
-          button.disabled = true;
-          button.textContent = "Running Tests…";
-          try {
-            const state = await api(`/api/accepted/${candidateId}/run-tests`, {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({
-                dockerfilePath,
-                dockerfileContent,
-                dockerfileSource: editor?.dataset.dockerfileSource || "manual",
-                reasoningSummary: reasoning?.textContent || editor?.dataset.reasoningSummary || "",
-              }),
-            });
-            activeAcceptedTestRuns.add(String(candidateId));
-            renderAcceptedTestRunState(container, candidateId, state);
-            ensureAcceptedTestRunPolling(container);
-            void pollAcceptedTestRunStates(container);
-          } catch (err) {
-            alert("Failed to run Docker tests: " + err.message);
-            button.disabled = false;
-            button.textContent = "Run Tests";
-          }
-        });
-      });
-
-      $$("[data-stop-accepted-tests]", container).forEach((button) => {
-        button.addEventListener("click", async () => {
-          const candidateId = button.dataset.stopAcceptedTests;
-          button.disabled = true;
-          try {
-            const state = await api(`/api/accepted/${candidateId}/stop-test-run`, {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-            });
-            renderAcceptedTestRunState(container, candidateId, state);
-          } catch (err) {
-            alert("Failed to stop Docker tests: " + err.message);
-            button.disabled = false;
-          }
-        });
-      });
-
-      $$("[data-fix-accepted-dockerfile]", container).forEach((button) => {
-        button.addEventListener("click", async () => {
-          const candidateId = button.dataset.fixAcceptedDockerfile;
-          const editor = $(`[data-accepted-dockerfile-editor="${candidateId}"]`, container);
-          const pathInput = $(`[data-accepted-dockerfile-path="${candidateId}"]`, container);
-          const contentInput = $(`[data-accepted-dockerfile-content="${candidateId}"]`, container);
-          const output = $(`[data-accepted-test-output="${candidateId}"]`, container);
-          const reasoning = $(`[data-accepted-dockerfile-reasoning="${candidateId}"]`, container);
-
-          try {
-            if (editor?.dataset.loaded !== "true") {
-              await loadAcceptedDockerfileEditor(container, candidateId, pathInput?.value);
-            }
-          } catch (err) {
-            alert("Failed to load Dockerfile before asking Gemini to fix it: " + err.message);
-            return;
-          }
-
-          const dockerfilePath = pathInput?.value?.trim();
-          const dockerfileContent = contentInput?.value || "";
-          const errorOutput = output?.textContent?.trim() || "";
-          if (!dockerfilePath || !dockerfileContent.trim()) {
-            alert("Load or generate a Dockerfile before asking Gemini to fix it.");
-            return;
-          }
-          if (!errorOutput) {
-            alert("Run Docker tests first so there is an error to send to Gemini.");
-            return;
-          }
-
-          button.disabled = true;
-          button.textContent = "Fixing…";
-          try {
-            const data = await api(`/api/accepted/${candidateId}/fix-test-dockerfile`, {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({
-                dockerfilePath,
-                dockerfileContent,
-                errorOutput,
-              }),
-            });
-            if (editor) {
-              editor.hidden = false;
-              editor.dataset.loaded = "true";
-              editor.dataset.dockerfileSource = data.source || "gemini_fix";
-              editor.dataset.reasoningSummary = data.reasoningSummary || "";
-            }
-            if (pathInput) pathInput.value = data.path || dockerfilePath;
-            if (contentInput) contentInput.value = data.content || dockerfileContent;
-            if (reasoning) {
-              reasoning.hidden = !data.reasoningSummary;
-              reasoning.textContent = data.reasoningSummary || "";
-            }
-            const status = $(`[data-accepted-dockerfile-status="${candidateId}"]`, container);
-            if (status) {
-              status.innerHTML = `Gemini updated <code>${esc(data.path || dockerfilePath)}</code> using the last Docker test failure. Review it, then rerun.`;
-            }
-            const toggleButton = $(`[data-toggle-accepted-dockerfile="${candidateId}"]`, container);
-            if (toggleButton) {
-              toggleButton.textContent = "Hide Dockerfile";
-            }
-          } catch (err) {
-            alert("Failed to fix Dockerfile with Gemini: " + err.message);
-          } finally {
-            button.disabled = false;
-            button.textContent = "Fix With Gemini";
-          }
-        });
-      });
+      renderAcceptedSummary(data.total, rows);
+      container.innerHTML = renderAcceptedTable(rows);
+      bindAcceptedListInteractions(container, rows);
 
       rows.forEach((row) => {
-        if (!row.activeTestRun) return;
-        renderAcceptedTestRunState(container, String(row.id), row.activeTestRun);
-        if (row.activeTestRun.status === "running") {
+        if (row.activeTestRun?.status === "running") {
           activeAcceptedTestRuns.add(String(row.id));
         }
-      });
-      rows.forEach((row) => {
-        if (!row.activeCodexReview) return;
-        renderAcceptedCodexReviewState(container, String(row.id), row.activeCodexReview);
-        if (row.activeCodexReview.status === "running") {
+        if (row.activeCodexReview?.status === "running") {
           activeAcceptedCodexReviews.set(String(row.id), Number(row.activeCodexReview.round || 1));
         }
       });
       if (activeAcceptedTestRuns.size) {
-        ensureAcceptedTestRunPolling(container);
+        ensureAcceptedTestRunPolling(container, loadAccepted);
       }
       if (activeAcceptedCodexReviews.size) {
         ensureCodexReviewPolling(container, loadAccepted);
@@ -2519,14 +2876,701 @@ ${esc(tmux?.attachB || "")}</pre>
         void loadAccepted();
       });
     } catch (err) {
-      container.innerHTML = `<div class="card"><div class="empty-state"><p>Error: ${err.message}</p></div></div>`;
+      renderAcceptedSummary(0, []);
+      container.innerHTML = `<tr><td colspan="11"><div class="empty-state"><p>Error: ${err.message}</p></div></td></tr>`;
       $("#accepted-pagination").innerHTML = "";
     }
   }
 
+  function renderAcceptedDetailPage(row) {
+    const details = row.details || {};
+    const codexTask = codexTaskState(details);
+    const usage = manualReproUsage(details);
+    const review = reviewQueueState(details);
+    const manualReview = manualReviewState(details);
+    const dockerTest = acceptedDockerTestState(details);
+    const analysis = acceptedAnalysisState(details);
+    const geminiReview = acceptedGeminiReviewState(details);
+    const activeTestRun = row.activeTestRun || null;
+    const activeCodexReview = row.activeCodexReview || null;
+    const reasons = Array.isArray(row.rejection_reasons) ? row.rejection_reasons : [];
+    const manualRepro = buildManualReproText({
+      repoFullName: row.repo_full_name,
+      repoUrl: row.repo_url,
+      prNumber: row.pr_number,
+      prUrl: row.pr_url,
+      preFixSha: row.pre_fix_sha,
+      details,
+    });
+    const issueCount = Number(row.issue_count) || (Array.isArray(row.issues) ? row.issues.length : 0);
+    const lastTestCommand = Array.isArray(dockerTest.lastRun.testCommand) && dockerTest.lastRun.testCommand.length
+      ? shellJoin(dockerTest.lastRun.testCommand)
+      : "";
+    const dockerfileReasoning = dockerTest.dockerfile.reasoningSummary
+      ? `<p class="dockerfile-editor-note" data-accepted-dockerfile-reasoning="${row.id}">${esc(dockerTest.dockerfile.reasoningSummary)}</p>`
+      : `<p class="dockerfile-editor-note" data-accepted-dockerfile-reasoning="${row.id}" hidden></p>`;
+    const setupButtonLabel = Array.isArray(row.issues) && row.issues.length === 1 ? "Setup Issue" : "Setup Repo";
+
+    return `
+      <div class="accepted-detail-shell">
+        <div class="accepted-detail-header">
+          <div class="accepted-detail-main">
+            <button type="button" class="btn btn-sm" data-back-to-accepted>Back To Accepted</button>
+            <div class="accepted-detail-breadcrumb">
+              <button type="button" class="accepted-inline-button" data-filter-accepted-repo="${row.repo_id}">${esc(row.repo_full_name)}</button>
+              <span>/</span>
+              <span>PR #${row.pr_number || "—"}</span>
+            </div>
+            <h2 class="page-title accepted-detail-title">${esc(row.pr_title || `PR #${row.pr_number || row.id}`)}</h2>
+            <p class="page-subtitle">Keep the table focused on navigation and do the real review work here: notes, Dockerfile iteration, manual repro, and Codex task prep all live on this page.</p>
+          </div>
+          <div class="accepted-card-actions">
+            <button type="button" class="btn btn-sm" data-setup-accepted="${row.id}">${setupButtonLabel}</button>
+            <button type="button" class="btn btn-sm btn-info" data-deep-scan-accepted="${esc(row.repo_full_name)}">Deep Scan Repo</button>
+            <button type="button" class="btn btn-sm btn-info" data-analyze-accepted-gemini="${row.id}">Analyze PR With Gemini</button>
+            <button type="button" class="btn btn-sm btn-info" data-open-task-workspace="${row.id}">Open Task</button>
+            <button type="button" class="btn btn-sm btn-danger" data-reject-accepted-repo="${row.repo_id}" data-reject-accepted-repo-name="${esc(row.repo_full_name)}">Reject Repo</button>
+            <a href="${esc(row.pr_url || "#")}" target="_blank" class="btn btn-sm btn-info">Open PR</a>
+          </div>
+        </div>
+
+        <div class="accepted-detail-metrics">
+          <div class="accepted-detail-metric">
+            <span class="accepted-detail-metric-label">Linked Issues</span>
+            <strong>${issueCount}</strong>
+          </div>
+          <div class="accepted-detail-metric">
+            <span class="accepted-detail-metric-label">Language Files</span>
+            <strong>${analysis.relevantSourceFiles.length}</strong>
+          </div>
+          <div class="accepted-detail-metric">
+            <span class="accepted-detail-metric-label">Language Lines</span>
+            <strong>${analysis.codeLinesChanged}</strong>
+          </div>
+          <div class="accepted-detail-metric">
+            <span class="accepted-detail-metric-label">Gemini</span>
+            <div>${acceptedGeminiBadge(geminiReview)}</div>
+          </div>
+          <div class="accepted-detail-metric">
+            <span class="accepted-detail-metric-label">Review Queue</span>
+            <div>${reviewStatusBadge(review.status)}</div>
+          </div>
+          <div class="accepted-detail-metric">
+            <span class="accepted-detail-metric-label">Docker Test</span>
+            <div>${acceptedDockerRunBadge(activeTestRun, dockerTest)}</div>
+          </div>
+          <div class="accepted-detail-metric">
+            <span class="accepted-detail-metric-label">Manual Repro</span>
+            <div><span class="badge ${usage.used ? "badge-completed" : "badge-warn"}">${usage.used ? "Used" : "Unused"}</span></div>
+          </div>
+        </div>
+
+        <div class="card accepted-detail-card">
+          <div class="accepted-card-header">
+            <div class="accepted-card-title">
+              <span class="badge badge-accepted">Accepted</span>
+              <span class="badge badge-info">Scan #${row.scan_id}</span>
+              <span class="badge badge-info">${esc(acceptedDockerfileSourceLabel(dockerTest.dockerfile.source))}</span>
+              ${acceptedGeminiBadge(geminiReview)}
+            </div>
+            <div class="accepted-card-actions">
+              <button type="button" class="btn btn-sm" data-toggle-manual-repro-used="${row.id}" data-used="${usage.used ? "1" : "0"}">${usage.used ? "Mark Unused" : "Mark Used"}</button>
+              <button type="button" class="btn btn-sm btn-danger" data-manual-reject="${row.id}" ${manualReview.rejected ? "disabled" : ""}>${manualReview.rejected ? "Rejected" : "Reject Issue"}</button>
+            </div>
+          </div>
+
+          ${row.pr_title ? `<p class="accepted-pr-title">${esc(row.pr_title)}</p>` : ""}
+
+          <dl class="detail-kv accepted-meta">
+            <dt>Repository</dt><dd><button type="button" class="accepted-inline-button" data-filter-accepted-repo="${row.repo_id}">${esc(row.repo_full_name)}</button></dd>
+            <dt>Pull Request</dt><dd>${row.pr_number ? `<a href="${esc(row.pr_url || "#")}" target="_blank" class="repo-link">#${row.pr_number}</a>` : "—"}</dd>
+            <dt>Merged</dt><dd>${fmtDate(row.pr_merged_at || row.created_at)}</dd>
+            <dt>Issue Count</dt><dd>${issueCount}</dd>
+            <dt>Language Files</dt><dd>${analysis.relevantSourceFiles.length}</dd>
+            <dt>Language Lines</dt><dd>${analysis.codeLinesChanged}</dd>
+            <dt>Manual Repro</dt><dd>${usage.used ? `Used ${fmtDate(usage.usedAt)}` : "Not used yet"}</dd>
+            <dt>Manual Review</dt><dd>${manualReview.rejected ? `Rejected ${fmtDate(manualReview.rejectedAt)}` : "Not manually rejected"}</dd>
+          </dl>
+
+          <div class="detail-section">
+            <h4>Issues</h4>
+            ${renderAcceptedIssues(row.issues, { geminiReview })}
+          </div>
+
+          ${manualReview.rejected ? `<p class="accepted-reasons">${esc(manualReview.reason || "manually rejected by user")}</p>` : ""}
+          ${reasons.length ? `<p class="accepted-reasons">${esc(reasons.join(" · "))}</p>` : ""}
+          ${manualRepro ? renderManualReproBlock(`accepted-detail-${row.id}`, manualRepro) : ""}
+        </div>
+
+        <div class="card">
+          <div class="accepted-review-panel accepted-gemini-panel">
+            <div class="accepted-review-header">
+              <div class="accepted-card-title">
+                <strong>Gemini PR Analysis</strong>
+                ${acceptedGeminiBadge(geminiReview)}
+              </div>
+              <span class="accepted-review-meta">${geminiReview.analyzedAt ? `Updated ${fmtDate(geminiReview.analyzedAt)}` : "Not analyzed yet"}</span>
+            </div>
+            <p>${esc(geminiReview.summary || "Run Gemini analysis to have each accepted issue checked against the PR description for bug-fix / feature complexity.")}</p>
+            <div class="accepted-card-actions">
+              <button type="button" class="btn btn-sm btn-info" data-analyze-accepted-gemini="${row.id}">Analyze PR With Gemini</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="accepted-review-panel">
+            <div class="accepted-review-header">
+              <strong>Review Queue</strong>
+              <span class="accepted-review-meta">${review.updatedAt ? `Updated ${fmtDate(review.updatedAt)}` : "Not reviewed yet"}</span>
+            </div>
+            <div class="accepted-review-controls">
+              <select class="accepted-review-select" data-review-status="${row.id}">
+                <option value="new" ${review.status === "new" ? "selected" : ""}>New</option>
+                <option value="reviewing" ${review.status === "reviewing" ? "selected" : ""}>Reviewing</option>
+                <option value="approved" ${review.status === "approved" ? "selected" : ""}>Approved</option>
+                <option value="follow_up" ${review.status === "follow_up" ? "selected" : ""}>Follow Up</option>
+              </select>
+              <textarea class="accepted-review-notes" data-review-notes="${row.id}" placeholder="Add manual review notes...">${esc(review.notes)}</textarea>
+              <div class="accepted-card-actions">
+                <button type="button" class="btn btn-sm btn-info" data-save-review="${row.id}">Save Review</button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="accepted-review-panel accepted-test-panel">
+            <div class="accepted-review-header">
+              <div class="accepted-card-title">
+                <strong>Docker Test Run</strong>
+                ${acceptedDockerRunBadge(activeTestRun, dockerTest)}
+                <span class="badge badge-info">${esc(acceptedDockerfileSourceLabel(dockerTest.dockerfile.source))}</span>
+              </div>
+              <span class="accepted-review-meta">
+                ${dockerTest.lastRun.finishedAt
+                  ? `${dockerTest.lastRun.success ? "Passed" : "Failed"} ${fmtDate(dockerTest.lastRun.finishedAt)}`
+                  : "Not run yet"}
+              </span>
+            </div>
+            <div class="accepted-test-summary">
+              <p><strong>Dockerfile:</strong> <code>${esc(dockerTest.dockerfile.path)}</code>${dockerTest.dockerfile.sha256 ? ` (${esc(dockerTest.dockerfile.sha256.slice(0, 12))})` : ""}</p>
+              <p><strong>Updated:</strong> ${dockerTest.dockerfile.updatedAt ? fmtDate(dockerTest.dockerfile.updatedAt) : "Not generated yet"}</p>
+              <p><strong>Last Result:</strong> ${esc(dockerTest.lastRun.summary || "No Docker test run has been recorded yet.")}</p>
+              ${lastTestCommand ? `<p><strong>Last Test Command:</strong> <code>${esc(lastTestCommand)}</code></p>` : ""}
+            </div>
+            <div class="accepted-card-actions accepted-test-actions">
+              <button type="button" class="btn btn-sm" data-toggle-accepted-dockerfile="${row.id}">Edit Dockerfile</button>
+              <button type="button" class="btn btn-sm btn-info" data-generate-accepted-dockerfile="${row.id}">Gemini Test Dockerfile</button>
+              <button type="button" class="btn btn-sm btn-info" data-run-accepted-tests="${row.id}">Run Tests</button>
+              <button type="button" class="btn btn-sm btn-danger" data-stop-accepted-tests="${row.id}" hidden>Stop</button>
+              <button type="button" class="btn btn-sm" data-fix-accepted-dockerfile="${row.id}" ${dockerTest.lastRun.finishedAt && !dockerTest.lastRun.success ? "" : "disabled"}>Fix With Gemini</button>
+            </div>
+            <div class="tests-unable-editor accepted-dockerfile-editor" data-accepted-dockerfile-editor="${row.id}" data-loaded="${dockerTest.dockerfile.reasoningSummary || dockerTest.dockerfile.updatedAt ? "true" : "false"}" data-dockerfile-source="${esc(dockerTest.dockerfile.source)}" data-reasoning-summary="${esc(dockerTest.dockerfile.reasoningSummary)}" hidden>
+              <div class="tests-unable-editor-header">
+                <div class="form-group" style="margin:0; flex:1;">
+                  <label>Dockerfile Path</label>
+                  <input type="text" data-accepted-dockerfile-path="${row.id}" value="${esc(dockerTest.dockerfile.path)}" placeholder="Dockerfile" spellcheck="false">
+                </div>
+                <button type="button" class="btn btn-sm" data-load-accepted-dockerfile="${row.id}">Reload</button>
+              </div>
+              <p class="dockerfile-editor-note" data-accepted-dockerfile-status="${row.id}">Load or generate the Dockerfile you want to use for the manual Docker test run.</p>
+              <div data-accepted-dockerfile-choices="${row.id}"></div>
+              ${dockerfileReasoning}
+              <textarea class="dockerfile-editor-input" data-accepted-dockerfile-content="${row.id}" spellcheck="false" placeholder="Dockerfile content will appear here after loading.">${esc(typeof details?.acceptedTest?.dockerfile?.content === "string" ? details.acceptedTest.dockerfile.content : "")}</textarea>
+            </div>
+            <div class="tests-unable-rerun-panel accepted-test-run-panel" data-accepted-test-panel="${row.id}" hidden>
+              <div class="tests-unable-rerun-meta">
+                <span class="badge badge-running" data-accepted-test-status-badge="${row.id}">running</span>
+                <span class="tests-unable-rerun-stage" data-accepted-test-stage="${row.id}">Starting Docker test run…</span>
+              </div>
+              <pre class="log-output log-output-compact tests-unable-live-output" data-accepted-test-output="${row.id}">Waiting for Docker output…</pre>
+            </div>
+            ${row.logFiles?.length ? row.logFiles.map((log) => `
+              <details class="accepted-log-details">
+                <summary>${esc(log.label)}</summary>
+                <pre class="log-output log-output-compact">${esc(log.excerpt)}</pre>
+              </details>
+            `).join("") : ""}
+          </div>
+        </div>
+
+        <div class="card">
+          ${renderCodexTaskPanel(row, codexTask, activeCodexReview)}
+        </div>
+      </div>
+    `;
+  }
+
+  function bindAcceptedDetailInteractions(container, row, reloadHandler) {
+    attachManualReproCopyHandlers(container);
+    bindCodexTaskInteractions(container, reloadHandler);
+
+    $$("[data-back-to-accepted]", container).forEach((button) => {
+      button.addEventListener("click", () => switchPage("accepted"));
+    });
+
+    $$("[data-filter-accepted-repo]", container).forEach((button) => {
+      button.addEventListener("click", () => showAcceptedRepoFilter(button.dataset.filterAcceptedRepo));
+    });
+
+    $$("[data-open-task-workspace]", container).forEach((button) => {
+      button.addEventListener("click", () => openTaskWorkspace(button.dataset.openTaskWorkspace));
+    });
+
+    $$("[data-deep-scan-accepted]", container).forEach((button) => {
+      button.addEventListener("click", () => prepareSingleRepoDeepScan(button.dataset.deepScanAccepted));
+    });
+
+    $$("[data-analyze-accepted-gemini]", container).forEach((button) => {
+      button.addEventListener("click", async () => {
+        const candidateId = button.dataset.analyzeAcceptedGemini;
+        button.disabled = true;
+        button.textContent = "Analyzing…";
+        try {
+          await api(`/api/accepted/${candidateId}/analyze-with-gemini`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+          });
+          showToast("Gemini analysis saved.", "success");
+          await reloadHandler();
+        } catch (err) {
+          showToast(`Failed to analyze PR with Gemini: ${err.message}`, "error");
+          button.disabled = false;
+          button.textContent = "Analyze PR With Gemini";
+        }
+      });
+    });
+
+    $$("[data-setup-accepted]", container).forEach((button) => {
+      button.addEventListener("click", () => prepareAcceptedSetup(row));
+    });
+
+    $$("[data-reject-accepted-repo]", container).forEach((button) => {
+      button.addEventListener("click", async () => {
+        const repoId = button.dataset.rejectAcceptedRepo;
+        const repoName = button.dataset.rejectAcceptedRepoName || row.repo_full_name || "this repo";
+        if (!confirm(`Reject all currently accepted items from ${repoName}?`)) return;
+        button.disabled = true;
+        try {
+          const result = await api(`/api/accepted/repo/${repoId}/manual-reject`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+          });
+          showToast(`Rejected ${result.rejectedCount} accepted item(s) from ${result.repoFullName || repoName}.`, "success");
+          acceptedDetailCandidateId = null;
+          await loadDashboard();
+          switchPage("accepted");
+        } catch (err) {
+          showToast(`Failed to reject repo: ${err.message}`, "error");
+          button.disabled = false;
+        }
+      });
+    });
+
+    $$("[data-toggle-manual-repro-used]", container).forEach((button) => {
+      button.addEventListener("click", async () => {
+        const candidateId = button.dataset.toggleManualReproUsed;
+        const nextUsed = button.dataset.used !== "1";
+        button.disabled = true;
+        try {
+          await api(`/api/candidates/${candidateId}/manual-repro-usage`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ used: nextUsed }),
+          });
+          showToast(`Manual repro marked as ${nextUsed ? "used" : "unused"}.`, "success");
+          await reloadHandler();
+        } catch (err) {
+          showToast(`Failed to update manual repro usage: ${err.message}`, "error");
+          button.disabled = false;
+        }
+      });
+    });
+
+    $$("[data-manual-reject]", container).forEach((button) => {
+      button.addEventListener("click", async () => {
+        const candidateId = button.dataset.manualReject;
+        if (!confirm("Reject this accepted issue and remove the PR from the accepted queue?")) return;
+        button.disabled = true;
+        try {
+          await api(`/api/accepted/${candidateId}/manual-reject`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+          });
+          showToast("Accepted issue rejected.", "success");
+          acceptedDetailCandidateId = null;
+          await loadDashboard();
+          switchPage("accepted");
+        } catch (err) {
+          showToast(`Failed to reject candidate: ${err.message}`, "error");
+          button.disabled = false;
+        }
+      });
+    });
+
+    $$("[data-save-review]", container).forEach((button) => {
+      button.addEventListener("click", async () => {
+        const candidateId = button.dataset.saveReview;
+        const statusInput = $(`[data-review-status="${candidateId}"]`, container);
+        const notesInput = $(`[data-review-notes="${candidateId}"]`, container);
+        button.disabled = true;
+        try {
+          await api(`/api/candidates/${candidateId}/review`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              status: statusInput?.value || "new",
+              notes: notesInput?.value || "",
+            }),
+          });
+          showToast("Review saved.", "success");
+          await reloadHandler();
+        } catch (err) {
+          showToast(`Failed to save review: ${err.message}`, "error");
+          button.disabled = false;
+        }
+      });
+    });
+
+    $$("[data-toggle-accepted-dockerfile]", container).forEach((button) => {
+      button.addEventListener("click", async () => {
+        const candidateId = button.dataset.toggleAcceptedDockerfile;
+        const editor = $(`[data-accepted-dockerfile-editor="${candidateId}"]`, container);
+        if (!editor) return;
+        if (editor.hidden) {
+          if (editor.dataset.loaded === "true") {
+            editor.hidden = false;
+            button.textContent = "Hide Dockerfile";
+            return;
+          }
+          try {
+            await loadAcceptedDockerfileEditor(container, candidateId, undefined);
+          } catch (err) {
+            showToast(`Failed to load Dockerfile: ${err.message}`, "error");
+          }
+          return;
+        }
+        editor.hidden = true;
+        button.textContent = "Edit Dockerfile";
+      });
+    });
+
+    $$("[data-load-accepted-dockerfile]", container).forEach((button) => {
+      button.addEventListener("click", async () => {
+        const candidateId = button.dataset.loadAcceptedDockerfile;
+        const pathInput = $(`[data-accepted-dockerfile-path="${candidateId}"]`, container);
+        try {
+          await loadAcceptedDockerfileEditor(container, candidateId, pathInput?.value);
+        } catch (err) {
+          showToast(`Failed to load Dockerfile: ${err.message}`, "error");
+        }
+      });
+    });
+
+    $$("[data-generate-accepted-dockerfile]", container).forEach((button) => {
+      button.addEventListener("click", async () => {
+        const candidateId = button.dataset.generateAcceptedDockerfile;
+        const editor = $(`[data-accepted-dockerfile-editor="${candidateId}"]`, container);
+        const pathInput = $(`[data-accepted-dockerfile-path="${candidateId}"]`, container);
+        const contentInput = $(`[data-accepted-dockerfile-content="${candidateId}"]`, container);
+        const status = $(`[data-accepted-dockerfile-status="${candidateId}"]`, container);
+        const choices = $(`[data-accepted-dockerfile-choices="${candidateId}"]`, container);
+        const reasoning = $(`[data-accepted-dockerfile-reasoning="${candidateId}"]`, container);
+        button.disabled = true;
+        button.textContent = "Generating…";
+        try {
+          const data = await api(`/api/accepted/${candidateId}/generate-test-dockerfile`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              dockerfilePath: pathInput?.value?.trim() || undefined,
+            }),
+          });
+          if (editor) {
+            editor.hidden = false;
+            editor.dataset.loaded = "true";
+            editor.dataset.dockerfileSource = data.source || "gemini";
+            editor.dataset.reasoningSummary = data.reasoningSummary || "";
+          }
+          if (pathInput) pathInput.value = data.path || (pathInput?.value || "Dockerfile");
+          if (contentInput) contentInput.value = data.content || "";
+          if (status) {
+            status.innerHTML = `Gemini generated <code>${esc(data.path || "Dockerfile")}</code> for running tests in Docker. Review it, then run tests.`;
+          }
+          if (choices) {
+            choices.innerHTML = renderAcceptedDockerfileChoices(candidateId, data.availablePaths, data.path || pathInput?.value || "Dockerfile");
+            $$(`[data-accepted-dockerfile-choice="${candidateId}"]`, container).forEach((choice) => {
+              choice.addEventListener("click", async () => {
+                const nextPath = choice.dataset.acceptedDockerfileChoicePath || "";
+                try {
+                  await loadAcceptedDockerfileEditor(container, candidateId, nextPath);
+                } catch (err) {
+                  showToast(`Failed to load Dockerfile: ${err.message}`, "error");
+                }
+              });
+            });
+          }
+          if (reasoning) {
+            reasoning.hidden = !data.reasoningSummary;
+            reasoning.textContent = data.reasoningSummary || "";
+          }
+          const toggleButton = $(`[data-toggle-accepted-dockerfile="${candidateId}"]`, container);
+          if (toggleButton) toggleButton.textContent = "Hide Dockerfile";
+          const fixButton = $(`[data-fix-accepted-dockerfile="${candidateId}"]`, container);
+          if (fixButton) fixButton.disabled = true;
+          showToast("Gemini test Dockerfile generated.", "success");
+        } catch (err) {
+          showToast(`Failed to generate Dockerfile with Gemini: ${err.message}`, "error");
+        } finally {
+          button.disabled = false;
+          button.textContent = "Gemini Test Dockerfile";
+        }
+      });
+    });
+
+    $$("[data-run-accepted-tests]", container).forEach((button) => {
+      button.addEventListener("click", async () => {
+        const candidateId = button.dataset.runAcceptedTests;
+        const editor = $(`[data-accepted-dockerfile-editor="${candidateId}"]`, container);
+        const pathInput = $(`[data-accepted-dockerfile-path="${candidateId}"]`, container);
+        const contentInput = $(`[data-accepted-dockerfile-content="${candidateId}"]`, container);
+        const reasoning = $(`[data-accepted-dockerfile-reasoning="${candidateId}"]`, container);
+
+        try {
+          if (editor?.dataset.loaded !== "true") {
+            await loadAcceptedDockerfileEditor(container, candidateId, pathInput?.value);
+          }
+        } catch (err) {
+          showToast(`Failed to load Dockerfile before running tests: ${err.message}`, "error");
+          return;
+        }
+
+        const dockerfilePath = pathInput?.value?.trim();
+        const dockerfileContent = contentInput?.value || "";
+        if (!dockerfilePath || !dockerfileContent.trim()) {
+          showToast("Load or generate a Dockerfile before running tests.", "error");
+          return;
+        }
+
+        button.disabled = true;
+        button.textContent = "Running Tests…";
+        try {
+          const state = await api(`/api/accepted/${candidateId}/run-tests`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              dockerfilePath,
+              dockerfileContent,
+              dockerfileSource: editor?.dataset.dockerfileSource || "manual",
+              reasoningSummary: reasoning?.textContent || editor?.dataset.reasoningSummary || "",
+            }),
+          });
+          activeAcceptedTestRuns.add(String(candidateId));
+          renderAcceptedTestRunState(container, candidateId, state);
+          ensureAcceptedTestRunPolling(container, reloadHandler);
+          void pollAcceptedTestRunStates(container);
+        } catch (err) {
+          showToast(`Failed to run Docker tests: ${err.message}`, "error");
+          button.disabled = false;
+          button.textContent = "Run Tests";
+        }
+      });
+    });
+
+    $$("[data-stop-accepted-tests]", container).forEach((button) => {
+      button.addEventListener("click", async () => {
+        const candidateId = button.dataset.stopAcceptedTests;
+        button.disabled = true;
+        try {
+          const state = await api(`/api/accepted/${candidateId}/stop-test-run`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+          });
+          renderAcceptedTestRunState(container, candidateId, state);
+        } catch (err) {
+          showToast(`Failed to stop Docker tests: ${err.message}`, "error");
+          button.disabled = false;
+        }
+      });
+    });
+
+    $$("[data-fix-accepted-dockerfile]", container).forEach((button) => {
+      button.addEventListener("click", async () => {
+        const candidateId = button.dataset.fixAcceptedDockerfile;
+        const editor = $(`[data-accepted-dockerfile-editor="${candidateId}"]`, container);
+        const pathInput = $(`[data-accepted-dockerfile-path="${candidateId}"]`, container);
+        const contentInput = $(`[data-accepted-dockerfile-content="${candidateId}"]`, container);
+        const output = $(`[data-accepted-test-output="${candidateId}"]`, container);
+        const reasoning = $(`[data-accepted-dockerfile-reasoning="${candidateId}"]`, container);
+
+        try {
+          if (editor?.dataset.loaded !== "true") {
+            await loadAcceptedDockerfileEditor(container, candidateId, pathInput?.value);
+          }
+        } catch (err) {
+          showToast(`Failed to load Dockerfile before asking Gemini to fix it: ${err.message}`, "error");
+          return;
+        }
+
+        const dockerfilePath = pathInput?.value?.trim();
+        const dockerfileContent = contentInput?.value || "";
+        const errorOutput = output?.textContent?.trim() || "";
+        if (!dockerfilePath || !dockerfileContent.trim()) {
+          showToast("Load or generate a Dockerfile before asking Gemini to fix it.", "error");
+          return;
+        }
+        if (!errorOutput) {
+          showToast("Run Docker tests first so there is an error to send to Gemini.", "error");
+          return;
+        }
+
+        button.disabled = true;
+        button.textContent = "Fixing…";
+        try {
+          const data = await api(`/api/accepted/${candidateId}/fix-test-dockerfile`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              dockerfilePath,
+              dockerfileContent,
+              errorOutput,
+            }),
+          });
+          if (editor) {
+            editor.hidden = false;
+            editor.dataset.loaded = "true";
+            editor.dataset.dockerfileSource = data.source || "gemini_fix";
+            editor.dataset.reasoningSummary = data.reasoningSummary || "";
+          }
+          if (pathInput) pathInput.value = data.path || dockerfilePath;
+          if (contentInput) contentInput.value = data.content || dockerfileContent;
+          if (reasoning) {
+            reasoning.hidden = !data.reasoningSummary;
+            reasoning.textContent = data.reasoningSummary || "";
+          }
+          const status = $(`[data-accepted-dockerfile-status="${candidateId}"]`, container);
+          if (status) {
+            status.innerHTML = `Gemini updated <code>${esc(data.path || dockerfilePath)}</code> using the last Docker test failure. Review it, then rerun.`;
+          }
+          const toggleButton = $(`[data-toggle-accepted-dockerfile="${candidateId}"]`, container);
+          if (toggleButton) toggleButton.textContent = "Hide Dockerfile";
+          showToast("Gemini updated the Dockerfile draft.", "success");
+        } catch (err) {
+          showToast(`Failed to fix Dockerfile with Gemini: ${err.message}`, "error");
+        } finally {
+          button.disabled = false;
+          button.textContent = "Fix With Gemini";
+        }
+      });
+    });
+
+    if (row.activeTestRun) {
+      renderAcceptedTestRunState(container, String(row.id), row.activeTestRun);
+      if (row.activeTestRun.status === "running") {
+        activeAcceptedTestRuns.add(String(row.id));
+      }
+    }
+    if (row.activeCodexReview) {
+      renderAcceptedCodexReviewState(container, String(row.id), row.activeCodexReview);
+      if (row.activeCodexReview.status === "running") {
+        activeAcceptedCodexReviews.set(String(row.id), Number(row.activeCodexReview.round || 1));
+      }
+    }
+    if (activeAcceptedTestRuns.size) {
+      ensureAcceptedTestRunPolling(container, reloadHandler);
+    }
+    if (activeAcceptedCodexReviews.size) {
+      ensureCodexReviewPolling(container, reloadHandler);
+    }
+  }
+
+  async function loadAcceptedDetail() {
+    const container = $("#accepted-detail-page");
+    stopAcceptedTestRunPolling();
+    stopAcceptedCodexReviewPolling();
+    activeAcceptedTestRuns.clear();
+    activeAcceptedCodexReviews.clear();
+
+    if (!acceptedDetailCandidateId) {
+      container.innerHTML = `
+        <div class="card">
+          <div class="empty-state">
+            <div class="empty-icon">✅</div>
+            <p>Select a candidate from the accepted table to open its dedicated review page.</p>
+            <button type="button" class="btn btn-sm" data-back-to-accepted>Back To Accepted</button>
+          </div>
+        </div>
+      `;
+      $$("[data-back-to-accepted]", container).forEach((button) => {
+        button.addEventListener("click", () => switchPage("accepted"));
+      });
+      return;
+    }
+
+    container.innerHTML = `<div class="card"><div class="empty-state"><p>Loading accepted candidate…</p></div></div>`;
+    try {
+      const row = await api(`/api/accepted/${acceptedDetailCandidateId}`);
+      container.innerHTML = renderAcceptedDetailPage(row);
+      bindAcceptedDetailInteractions(container, row, loadAcceptedDetail);
+    } catch (err) {
+      container.innerHTML = `
+        <div class="card">
+          <div class="empty-state">
+            <p>Error: ${err.message}</p>
+            <button type="button" class="btn btn-sm" data-back-to-accepted>Back To Accepted</button>
+          </div>
+        </div>
+      `;
+      $$("[data-back-to-accepted]", container).forEach((button) => {
+        button.addEventListener("click", () => switchPage("accepted"));
+      });
+    }
+  }
+
+  let acceptedSearchTimer;
+  let acceptedSearchQuery = "";
+  $("#accepted-search").addEventListener("input", (event) => {
+    clearTimeout(acceptedSearchTimer);
+    acceptedSearchTimer = setTimeout(() => {
+      acceptedSearchQuery = event.target.value.trim();
+      acceptedPage = 0;
+      void loadAccepted();
+    }, 250);
+  });
+
+  $("#accepted-repo-filter").addEventListener("change", (event) => {
+    acceptedRepoFilter = event.target.value || "";
+    acceptedPage = 0;
+    void loadAccepted();
+  });
+
   $("#accepted-review-filter").addEventListener("change", (event) => {
     acceptedReviewFilter = event.target.value || "all";
     acceptedPage = 0;
+    void loadAccepted();
+  });
+
+  $("#accepted-docker-filter").addEventListener("change", (event) => {
+    acceptedDockerFilter = event.target.value || "all";
+    acceptedPage = 0;
+    void loadAccepted();
+  });
+
+  $("#accepted-sort").addEventListener("change", (event) => {
+    acceptedSort = event.target.value || "merged_desc";
+    acceptedPage = 0;
+    void loadAccepted();
+  });
+
+  $("#accepted-clear-filters").addEventListener("click", () => {
+    acceptedSearchQuery = "";
+    acceptedRepoFilter = "";
+    acceptedReviewFilter = "all";
+    acceptedDockerFilter = "all";
+    acceptedSort = "merged_desc";
+    acceptedPage = 0;
+    syncAcceptedFilterControls();
     void loadAccepted();
   });
 
@@ -2601,8 +3645,7 @@ ${esc(tmux?.attachB || "")}</pre>
       });
       $$("[data-task-open-accepted]", container).forEach((button) => {
         button.addEventListener("click", () => {
-          expandedAcceptedRows.add(String(button.dataset.taskOpenAccepted));
-          switchPage("accepted");
+          openAcceptedDetail(button.dataset.taskOpenAccepted);
         });
       });
       bindCodexTaskInteractions(container, loadTasksPage);
@@ -2630,6 +3673,8 @@ ${esc(tmux?.attachB || "")}</pre>
       const data = await api(`/api/issues?limit=${ISSUES_PER_PAGE}&offset=${issuesPage * ISSUES_PER_PAGE}`);
       const tbody = $("#issues-tbody");
 
+      renderTableSummary("#issues-summary", data.total, ISSUES_PER_PAGE, issuesPage);
+
       if (data.rows.length === 0) {
         tbody.innerHTML = `<tr><td colspan="6"><div class="empty-state"><div class="empty-icon">🐛</div><p>No issues yet. Run a scan to discover verified issues.</p></div></td></tr>`;
         $("#issues-pagination").innerHTML = "";
@@ -2638,11 +3683,11 @@ ${esc(tmux?.attachB || "")}</pre>
 
       tbody.innerHTML = data.rows.map((i) => `
         <tr>
-          <td><a href="${esc(i.url || '#')}" target="_blank" class="repo-link">${esc(i.title || `#${i.number}`)}</a></td>
-          <td>${esc(i.repo_full_name)}</td>
-          <td>#${i.pr_number} — ${esc(i.pr_title || "")}</td>
+          <td><a href="${esc(i.url || '#')}" target="_blank" class="repo-link-external">${esc(i.title || `#${i.number}`)}</a></td>
+          <td><a href="https://github.com/${esc(i.repo_full_name)}" target="_blank" class="repo-link-external">${esc(i.repo_full_name)}</a></td>
+          <td><a href="${esc(i.pr_url || '#')}" target="_blank" class="repo-link-external">PR #${i.pr_number}</a> — ${esc(i.pr_title || "")}</td>
           <td><span class="badge ${i.state === 'open' ? 'badge-open' : 'badge-closed'}">${i.state || "—"}</span></td>
-          <td>${esc(i.link_type)}</td>
+          <td><span class="link-type-label">${esc(humanLinkType(i.link_type))}</span></td>
           <td><button type="button" class="btn btn-sm" data-setup-issue="${i.id}">Setup</button></td>
         </tr>
       `).join("");
@@ -2687,6 +3732,8 @@ ${esc(tmux?.attachB || "")}</pre>
           <td><button class="btn btn-sm btn-info" data-scan-id="${s.id}">Details</button></td>
         </tr>
       `).join("");
+
+      renderTableSummary("#scans-summary", data.total, SCANS_PER_PAGE, scansPage);
 
       renderPagination($("#scans-pagination"), data.total, SCANS_PER_PAGE, scansPage, (p) => { scansPage = p; loadScans(); });
 
@@ -3385,6 +4432,49 @@ ${esc(tmux?.attachB || "")}</pre>
     try { return JSON.parse(s); } catch { return fallback; }
   }
 
+  /* ---- Toast notification system ---- */
+  function showToast(message, type = 'info', durationMs = 4000) {
+    const container = $('#toast-container');
+    if (!container) return;
+    const icons = { success: '✅', error: '❌', info: 'ℹ️' };
+    const toast = document.createElement('div');
+    toast.className = `toast toast-${type}`;
+    toast.innerHTML = `
+      <span class="toast-icon">${icons[type] || icons.info}</span>
+      <span class="toast-message">${esc(message)}</span>
+      <button class="toast-dismiss" aria-label="Dismiss">&times;</button>
+    `;
+    container.appendChild(toast);
+    const dismiss = () => {
+      toast.classList.add('toast-exit');
+      setTimeout(() => toast.remove(), 300);
+    };
+    toast.querySelector('.toast-dismiss').addEventListener('click', dismiss);
+    if (durationMs > 0) setTimeout(dismiss, durationMs);
+  }
+
+  /* ---- Link type humanizer ---- */
+  function humanLinkType(linkType) {
+    const map = {
+      github_linked: 'GitHub Linked',
+      body_reference: 'Body Reference',
+      commit_reference: 'Commit Reference',
+      timeline_reference: 'Timeline Reference',
+      closing_reference: 'Closing Reference',
+    };
+    return map[linkType] || (linkType || '—').replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+  }
+
+  /* ---- Table summary helper ---- */
+  function renderTableSummary(containerId, total, perPage, page) {
+    const el = $(containerId);
+    if (!el) return;
+    if (!total) { el.innerHTML = ''; return; }
+    const start = page * perPage + 1;
+    const end = Math.min((page + 1) * perPage, total);
+    el.innerHTML = `<span class="summary-left">Showing <strong>${start}–${end}</strong> of <strong>${total}</strong></span>`;
+  }
+
   /* ---- Page loader ---- */
   function loadPage(page) {
     switch (page) {
@@ -3392,6 +4482,7 @@ ${esc(tmux?.attachB || "")}</pre>
       case "repos": loadRepos(); break;
       case "setup": loadSetup(); break;
       case "accepted": loadAccepted(); break;
+      case "accepted-detail": loadAcceptedDetail(); break;
       case "tasks": loadTasksPage(); break;
       case "issues": loadIssues(); break;
       case "scans": loadScans(); break;

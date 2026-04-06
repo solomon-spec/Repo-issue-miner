@@ -59,12 +59,30 @@
       <section id="page-repos" class="page">
         <h2 class="page-title">Repositories</h2>
         <div class="toolbar">
-          <input type="text" id="repo-search" class="search-input" placeholder="Search repos…">
+          <input type="text" id="repo-search" class="search-input" placeholder="Search repos by name or description…">
+          <select id="repo-language-filter" class="filter-select">
+            <option value="">All Languages</option>
+          </select>
+          <select id="repo-status-filter" class="filter-select">
+            <option value="">All Statuses</option>
+            <option value="accepted">✅ Accepted</option>
+            <option value="rejected">❌ Rejected</option>
+          </select>
           <button type="button" class="btn btn-danger" id="delete-selected-repos" disabled>Delete Selected</button>
         </div>
         <div class="card">
+          <div class="table-summary" id="repos-summary"></div>
           <div class="table-wrap"><table id="repos-table">
-            <thead><tr><th><input type="checkbox" id="select-all-repos" aria-label="Select all repos"></th><th>Repo</th><th>Stars</th><th>Language</th><th>PR Progress</th><th>Issues</th><th>Status</th><th>Actions</th></tr></thead>
+            <thead><tr>
+              <th><input type="checkbox" id="select-all-repos" aria-label="Select all repos"></th>
+              <th class="sortable-header" data-sort-col="repo">Repo <span class="sort-icon"></span></th>
+              <th class="sortable-header" data-sort-col="stars">Stars <span class="sort-icon"></span></th>
+              <th class="sortable-header" data-sort-col="language">Language <span class="sort-icon"></span></th>
+              <th>PR Progress</th>
+              <th class="sortable-header" data-sort-col="issues">Issues <span class="sort-icon"></span></th>
+              <th class="sortable-header" data-sort-col="status">Status <span class="sort-icon"></span></th>
+              <th>Actions</th>
+            </tr></thead>
             <tbody id="repos-tbody"></tbody>
           </table></div>
           <div class="pagination" id="repos-pagination"></div>
@@ -139,7 +157,7 @@
                 </div>
                 <div class="form-group setup-form-span-2">
                   <label for="setup-profile-prompt">Prompt</label>
-                  <textarea id="setup-profile-prompt" placeholder="Prepare this repository for later issue work. Create or improve a root Dockerfile, update native README instructions, pin dependencies, remove lock files, and do not touch source code."></textarea>
+                  <textarea id="setup-profile-prompt" placeholder="Prepare this repository for later issue work. Create or improve a root Dockerfile, keep the README focused on Docker build/run/test usage, pin dependencies in existing files, remove lock files, and do not touch source code."></textarea>
                 </div>
                 <div class="form-group">
                   <label for="setup-profile-context-paths">Context Files / Globs</label>
@@ -195,22 +213,71 @@
 
       <section id="page-accepted" class="page">
         <h2 class="page-title">Accepted Pull Requests</h2>
-        <div class="toolbar">
-          <select id="accepted-review-filter" class="search-input">
+        <p class="page-subtitle">Scan accepted candidates by repository, narrow the list with filters, and open each one in a dedicated review page instead of expanding rows inline.</p>
+        <div class="toolbar accepted-toolbar">
+          <input type="text" id="accepted-search" class="search-input" placeholder="Search accepted repos / PRs…">
+          <select id="accepted-repo-filter" class="filter-select">
+            <option value="">All Repositories</option>
+          </select>
+          <select id="accepted-review-filter" class="filter-select">
             <option value="all">All Review States</option>
             <option value="new">New</option>
             <option value="reviewing">Reviewing</option>
             <option value="approved">Approved</option>
             <option value="follow_up">Follow Up</option>
           </select>
+          <select id="accepted-docker-filter" class="filter-select">
+            <option value="all">All Docker States</option>
+            <option value="not_run">Docker Not Run</option>
+            <option value="passed">Docker Passed</option>
+            <option value="failed">Docker Failed</option>
+          </select>
+          <select id="accepted-sort" class="filter-select">
+            <option value="merged_desc">Newest Merged In Repo</option>
+            <option value="merged_asc">Oldest Merged In Repo</option>
+            <option value="issues_desc">Most Issues In Repo</option>
+            <option value="issues_asc">Fewest Issues In Repo</option>
+            <option value="pr_desc">Highest PR Number</option>
+            <option value="pr_asc">Lowest PR Number</option>
+            <option value="review_asc">Review Queue</option>
+            <option value="created_desc">Newest Accepted In Repo</option>
+          </select>
+          <button type="button" class="btn btn-sm" id="accepted-clear-filters">Clear Filters</button>
         </div>
-        <div id="accepted-list"></div>
-        <div class="pagination" id="accepted-pagination"></div>
+        <div id="accepted-toolbar-hint" class="accepted-toolbar-hint"></div>
+        <div class="table-summary" id="accepted-summary"></div>
+        <div class="card">
+          <div class="table-wrap">
+            <table id="accepted-table">
+              <thead>
+                <tr>
+                  <th>Pull Request</th>
+                  <th>Title</th>
+                  <th>Issues</th>
+                  <th>Lang Files</th>
+                  <th>Lang Lines</th>
+                  <th>Gemini</th>
+                  <th>Review</th>
+                  <th>Docker</th>
+                  <th>Manual Repro</th>
+                  <th>Merged</th>
+                  <th>Actions</th>
+                </tr>
+              </thead>
+              <tbody id="accepted-tbody"></tbody>
+            </table>
+          </div>
+          <div class="pagination" id="accepted-pagination"></div>
+        </div>
+      </section>
+
+      <section id="page-accepted-detail" class="page">
+        <div id="accepted-detail-page"></div>
       </section>
 
       <section id="page-tasks" class="page">
         <h2 class="page-title">Task Workspace</h2>
-        <p class="page-subtitle">Use this dedicated page to start an HFI task, compare the original issue against Prompt 1, and generate Codex review drafts for rounds 1-4.</p>
+        <p class="page-subtitle">Use this dedicated page to start or restart an HFI task, compare the original issue against a Codex-rewritten Prompt 1, and generate Codex review drafts for rounds 1-4.</p>
         <div id="task-workspace"></div>
       </section>
 
@@ -226,8 +293,9 @@
       <section id="page-issues" class="page">
         <h2 class="page-title">Verified Issues</h2>
         <div class="card">
+          <div class="table-summary" id="issues-summary"></div>
           <div class="table-wrap"><table id="issues-table">
-            <thead><tr><th>Issue</th><th>Repo</th><th>PR</th><th>State</th><th>Link Type</th><th>Actions</th></tr></thead>
+            <thead><tr><th>Issue</th><th>Repository</th><th>Pull Request</th><th>State</th><th>Link Type</th><th>Actions</th></tr></thead>
             <tbody id="issues-tbody"></tbody>
           </table></div>
           <div class="pagination" id="issues-pagination"></div>
@@ -238,6 +306,7 @@
       <section id="page-scans" class="page">
         <h2 class="page-title">Scan History</h2>
         <div class="card">
+          <div class="table-summary" id="scans-summary"></div>
           <div class="table-wrap"><table id="scans-table">
             <thead><tr><th>ID</th><th>Status</th><th>Started</th><th>Duration</th><th>Accepted</th><th>Rejected</th><th>Actions</th></tr></thead>
             <tbody id="scans-tbody"></tbody>
@@ -331,6 +400,8 @@
       </section>
     </main>
   </div>
+  <!-- Toast notification container -->
+  <div id="toast-container" class="toast-container" aria-live="polite"></div>
   <script src="/app.js"></script>
 </body>
 </html>
