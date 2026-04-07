@@ -186,9 +186,58 @@
 
   /* ---- Navigation ---- */
   const pages = ["dashboard", "repos", "setup", "accepted", "accepted-detail", "tasks", "issues", "scans", "new-scan"];
+  const chromePageMeta = {
+    dashboard: {
+      title: "Dashboard",
+      chip: "overview",
+      subtitle: "Monitor the mining pipeline, review accepted work, and jump into setup or scan flows.",
+    },
+    repos: {
+      title: "Repositories",
+      chip: "inventory",
+      subtitle: "Screen mined repositories, inspect detail, and launch deep scans or setup tasks.",
+    },
+    setup: {
+      title: "Setup",
+      chip: "codex prep",
+      subtitle: "Configure setup profiles, choose a target, and inspect live setup run output in one place.",
+    },
+    accepted: {
+      title: "Accepted Pull Requests",
+      chip: "review queue",
+      subtitle: "Review accepted candidates, filter by repo or state, and move deeper only when a PR needs focused work.",
+    },
+    "accepted-detail": {
+      title: "Accepted Detail",
+      chip: "workspace",
+      subtitle: "Inspect a single accepted candidate with Gemini, Docker, manual repro, and Codex task workflows side by side.",
+    },
+    tasks: {
+      title: "Task Workspace",
+      chip: "codex flow",
+      subtitle: "Manage Prompt 1, round-by-round review drafts, and worktree context for accepted task runs.",
+    },
+    issues: {
+      title: "Verified Issues",
+      chip: "issue links",
+      subtitle: "Browse linked issues and jump straight into setup for the most relevant target.",
+    },
+    scans: {
+      title: "Scan History",
+      chip: "metrics",
+      subtitle: "Inspect historical scans, outcomes, and candidate detail without leaving the dashboard.",
+    },
+    "new-scan": {
+      title: "New Scan",
+      chip: "launchpad",
+      subtitle: "Tune scan parameters, launch a run, and watch the live pipeline state update in place.",
+    },
+  };
   let currentPage = "dashboard";
   const selectedRepoIds = new Set();
   let visibleRepoIds = [];
+  let repoSearchQuery = "";
+  let acceptedSearchQuery = "";
   let taskWorkspaceCandidateId = null;
   let selectedSetupTarget = null;
   let setupProfilesCache = [];
@@ -207,6 +256,20 @@
     runId: null,
     tab: "overview",
   };
+
+  function updateChrome(page) {
+    const meta = chromePageMeta[page] || chromePageMeta.dashboard;
+    const title = $("#topbar-page-title");
+    const chip = $("#topbar-page-chip");
+    const subtitle = $("#topbar-page-subtitle");
+    const search = $("#global-search");
+    if (title) title.textContent = meta.title;
+    if (chip) chip.textContent = meta.chip;
+    if (subtitle) subtitle.textContent = meta.subtitle;
+    if (search) {
+      search.value = (page === "accepted" || page === "accepted-detail") ? acceptedSearchQuery : repoSearchQuery;
+    }
+  }
 
   function switchPage(page) {
     if (page !== "setup") {
@@ -231,6 +294,7 @@
     $$(".nav-links a").forEach((a) => {
       a.classList.toggle("active", a.dataset.page === activeNavPage);
     });
+    updateChrome(page);
     loadPage(page);
   }
 
@@ -239,6 +303,48 @@
       e.preventDefault();
       switchPage(a.dataset.page);
     });
+  });
+
+  $("#sidebar-start-scan")?.addEventListener("click", () => {
+    switchPage("new-scan");
+  });
+
+  $("#sidebar-open-tests-unable")?.addEventListener("click", () => {
+    void openTestsUnableModal();
+  });
+
+  $("#topbar-open-tests-unable")?.addEventListener("click", () => {
+    void openTestsUnableModal();
+  });
+
+  $("#topbar-open-new-scan")?.addEventListener("click", () => {
+    switchPage("new-scan");
+  });
+
+  $("#global-search")?.addEventListener("keydown", (event) => {
+    if (event.key !== "Enter") return;
+    event.preventDefault();
+    const query = event.target.value.trim();
+    if (currentPage === "accepted" || currentPage === "accepted-detail") {
+      acceptedSearchQuery = query;
+      acceptedPage = 0;
+      if ($("#accepted-search")) $("#accepted-search").value = query;
+      if (currentPage === "accepted") {
+        void loadAccepted();
+      } else {
+        switchPage("accepted");
+      }
+      return;
+    }
+
+    repoSearchQuery = query;
+    if ($("#repo-search")) $("#repo-search").value = query;
+    reposPage = 0;
+    if (currentPage === "repos") {
+      void loadRepos(query);
+    } else {
+      switchPage("repos");
+    }
   });
 
   function bindDashboardActions(ctx = document) {
@@ -456,8 +562,9 @@
 
   async function loadRepos(search) {
     try {
+      const searchValue = typeof search === "string" ? search : (repoSearchQuery || $("#repo-search")?.value?.trim() || "");
       const params = new URLSearchParams({ limit: REPOS_PER_PAGE, offset: reposPage * REPOS_PER_PAGE });
-      if (search) params.set("search", search);
+      if (searchValue) params.set("search", searchValue);
       if (reposSortCol) params.set("sortBy", reposSortCol);
       if (reposSortDir) params.set("sortDir", reposSortDir);
       if (reposLanguageFilter) params.set("language", reposLanguageFilter);
@@ -487,7 +594,7 @@
       renderTableSummary("#repos-summary", data.total, REPOS_PER_PAGE, reposPage);
 
       if (data.rows.length === 0) {
-        tbody.innerHTML = `<tr><td colspan="8"><div class="empty-state"><div class="empty-icon">📦</div><p>No repos found matching your filters. ${search || reposLanguageFilter || reposStatusFilter ? '<a href="#" class="repo-link" id="clear-repo-filters">Clear all filters</a>' : 'Start a scan to mine repositories.'}</p></div></td></tr>`;
+        tbody.innerHTML = `<tr><td colspan="8"><div class="empty-state"><div class="empty-icon">📦</div><p>No repos found matching your filters. ${searchValue || reposLanguageFilter || reposStatusFilter ? '<a href="#" class="repo-link" id="clear-repo-filters">Clear all filters</a>' : 'Start a scan to mine repositories.'}</p></div></td></tr>`;
         $("#repos-pagination").innerHTML = "";
         updateRepoBulkDeleteUI([]);
         const clearLink = $("#clear-repo-filters");
@@ -495,6 +602,7 @@
           clearLink.addEventListener("click", (e) => {
             e.preventDefault();
             $("#repo-search").value = "";
+            repoSearchQuery = "";
             reposLanguageFilter = "";
             reposStatusFilter = "";
             if (langSelect) langSelect.value = "";
@@ -593,9 +701,9 @@
     try {
       const data = await api(`/api/repos/${id}`);
       body.innerHTML = `
-        <div style="display:flex; gap:0.75rem; align-items:center; justify-content:space-between; flex-wrap:wrap; margin-bottom:1rem;">
-          <h2 style="margin:0;">${esc(data.full_name)}</h2>
-          <div style="display:flex; gap:0.6rem; flex-wrap:wrap;">
+        <div class="generic-panel-header section-spacer">
+          <h2>${esc(data.full_name)}</h2>
+          <div class="inline-actions">
             <button type="button" class="btn" data-modal-setup="${data.id}" data-modal-setup-name="${esc(data.full_name)}">Setup This Repo</button>
             <button type="button" class="btn btn-info" data-modal-deep-scan="${esc(data.full_name)}">Deep Scan This Repo</button>
           </div>
@@ -650,14 +758,14 @@
               details,
             });
             return `
-              <div style="margin-bottom:0.75rem; padding:0.75rem; border:1px solid var(--border); border-radius:8px;">
-                <div style="display:flex; gap:0.5rem; align-items:center; flex-wrap:wrap;">
+              <div class="candidate-stack">
+                <div class="candidate-stack-header">
                   ${c.accepted ? '<span class="badge badge-accepted">Accepted</span>' : '<span class="badge badge-rejected">Rejected</span>'}
                   ${c.tests_unable_to_run ? '<span class="badge badge-warn">⚠️ Tests Unable</span>' : ''}
-                  <span style="font-size:0.78rem; color:var(--text-muted);">SHA: ${esc(c.pre_fix_sha || "—").slice(0, 10)}</span>
+                  <span class="stack-note code-inline">SHA: ${esc(c.pre_fix_sha || "—").slice(0, 10)}</span>
                 </div>
-                ${c.tests_unable_to_run_reason ? `<p style="font-size:0.78rem; color:var(--accent-orange); margin-top:0.3rem;">${esc(c.tests_unable_to_run_reason)}</p>` : ''}
-                ${c.rejection_reasons ? `<p style="font-size:0.78rem; color:var(--accent-red); margin-top:0.3rem;">${esc(safeJSON(c.rejection_reasons, []).join(", "))}</p>` : ''}
+                ${c.tests_unable_to_run_reason ? `<p class="stack-note stack-warning">${esc(c.tests_unable_to_run_reason)}</p>` : ''}
+                ${c.rejection_reasons ? `<p class="stack-note stack-danger">${esc(safeJSON(c.rejection_reasons, []).join(", "))}</p>` : ''}
                 ${timings.length ? renderTimings(timings) : ''}
                 ${manualRepro ? renderManualReproBlock(`repo-candidate-${c.id}`, manualRepro) : ""}
               </div>
@@ -696,8 +804,10 @@
 
   let repoSearchTimer;
   $("#repo-search").addEventListener("input", (e) => {
+    repoSearchQuery = e.target.value.trim();
+    if ($("#global-search")) $("#global-search").value = repoSearchQuery;
     clearTimeout(repoSearchTimer);
-    repoSearchTimer = setTimeout(() => { reposPage = 0; loadRepos(e.target.value); }, 300);
+    repoSearchTimer = setTimeout(() => { reposPage = 0; loadRepos(repoSearchQuery); }, 300);
   });
 
   // Sortable header click handlers
@@ -3068,7 +3178,7 @@ ${esc(tmux?.attachB || "")}</pre>
             </div>
             <div class="tests-unable-editor accepted-dockerfile-editor" data-accepted-dockerfile-editor="${row.id}" data-loaded="${dockerTest.dockerfile.reasoningSummary || dockerTest.dockerfile.updatedAt ? "true" : "false"}" data-dockerfile-source="${esc(dockerTest.dockerfile.source)}" data-reasoning-summary="${esc(dockerTest.dockerfile.reasoningSummary)}" hidden>
               <div class="tests-unable-editor-header">
-                <div class="form-group" style="margin:0; flex:1;">
+                <div class="form-group field-stretch">
                   <label>Dockerfile Path</label>
                   <input type="text" data-accepted-dockerfile-path="${row.id}" value="${esc(dockerTest.dockerfile.path)}" placeholder="Dockerfile" spellcheck="false">
                 </div>
@@ -3529,11 +3639,11 @@ ${esc(tmux?.attachB || "")}</pre>
   }
 
   let acceptedSearchTimer;
-  let acceptedSearchQuery = "";
   $("#accepted-search").addEventListener("input", (event) => {
     clearTimeout(acceptedSearchTimer);
     acceptedSearchTimer = setTimeout(() => {
       acceptedSearchQuery = event.target.value.trim();
+      if ($("#global-search")) $("#global-search").value = acceptedSearchQuery;
       acceptedPage = 0;
       void loadAccepted();
     }, 250);
@@ -3756,7 +3866,10 @@ ${esc(tmux?.attachB || "")}</pre>
       const cfg = safeJSON(data.config_json, {});
       const metrics = safeJSON(data.metrics_json, null);
       body.innerHTML = `
-        <h2 style="margin-bottom:1rem;">Scan #${data.id} ${statusBadge(data.status)}</h2>
+        <div class="generic-panel-header section-spacer">
+          <h2>Scan #${data.id}</h2>
+          <div class="inline-actions">${statusBadge(data.status)}</div>
+        </div>
         <div class="detail-section">
           <h4>Summary</h4>
           <dl class="detail-kv">
@@ -3797,19 +3910,19 @@ ${esc(tmux?.attachB || "")}</pre>
               details,
             });
             return `
-              <div style="margin-bottom:0.75rem; padding:0.75rem; border:1px solid var(--border); border-radius:8px;">
-                <div style="display:flex; gap:0.5rem; align-items:center; flex-wrap:wrap; margin-bottom:0.3rem;">
-                  <strong>${esc(c.repo_full_name)}</strong>
+              <div class="candidate-stack">
+                <div class="candidate-stack-header">
+                  <strong class="candidate-stack-title">${esc(c.repo_full_name)}</strong>
                   ${c.accepted ? '<span class="badge badge-accepted">Accepted</span>' : '<span class="badge badge-rejected">Rejected</span>'}
                   ${c.tests_unable_to_run ? '<span class="badge badge-warn">⚠️ Tests Unable</span>' : ''}
-                  <span style="color:var(--text-muted); font-size:0.75rem;">⭐ ${c.repo_stars}</span>
+                  <span class="stack-note code-inline">⭐ ${c.repo_stars}</span>
                   ${c.pr_number ? `<a href="${esc(c.pr_url || "#")}" target="_blank" class="repo-link">PR #${c.pr_number}</a>` : ""}
                 </div>
-                ${c.pre_fix_sha ? `<p style="font-size:0.75rem; color:var(--text-muted);">SHA: <code>${esc(c.pre_fix_sha.slice(0, 12))}</code></p>` : ''}
-                ${c.tests_unable_to_run_reason ? `<p style="font-size:0.78rem; color:var(--accent-orange);">${esc(c.tests_unable_to_run_reason)}</p>` : ''}
-                ${reasons.length ? `<p style="font-size:0.78rem; color:var(--accent-red);">${esc(reasons.join(" · "))}</p>` : ''}
+                ${c.pre_fix_sha ? `<p class="stack-note">SHA: <code class="code-inline">${esc(c.pre_fix_sha.slice(0, 12))}</code></p>` : ''}
+                ${c.tests_unable_to_run_reason ? `<p class="stack-note stack-warning">${esc(c.tests_unable_to_run_reason)}</p>` : ''}
+                ${reasons.length ? `<p class="stack-note stack-danger">${esc(reasons.join(" · "))}</p>` : ''}
                 ${timings.length ? renderTimings(timings) : ''}
-                ${details.testPlan ? `<p style="font-size:0.75rem; color:var(--text-secondary); margin-top:0.3rem;">Plan: ${esc(details.testPlan.reasoningSummary || '—')}</p>` : ''}
+                ${details.testPlan ? `<p class="stack-note">Plan: ${esc(details.testPlan.reasoningSummary || '—')}</p>` : ''}
                 ${manualRepro ? renderManualReproBlock(`scan-candidate-${c.id}`, manualRepro) : ""}
               </div>
             `;
@@ -4024,14 +4137,16 @@ ${esc(tmux?.attachB || "")}</pre>
     try {
       const data = await api("/api/tests-unable?limit=50");
       body.innerHTML = `
-        <h2 style="margin-bottom:1rem;">Tests Unable (${data.total})</h2>
+        <div class="generic-panel-header section-spacer">
+          <h2>Tests Unable (${data.total})</h2>
+        </div>
         ${data.rows.length === 0 ? "<p>No tests-unable candidates found.</p>" : data.rows.map((row) => `
           <div class="tests-unable-card">
             <div class="tests-unable-card-header">
               <div class="tests-unable-card-title">
                 <strong>${esc(row.repo_full_name)}</strong>
                 <span class="badge badge-warn">Tests Unable</span>
-                <span style="font-size:0.78rem; color:var(--text-muted);">Scan #${row.scan_id}</span>
+                <span class="stack-note code-inline">Scan #${row.scan_id}</span>
                 ${row.pr_number ? `<a href="${esc(row.pr_url || "#")}" target="_blank" class="repo-link">PR #${row.pr_number}</a>` : ""}
               </div>
               <div class="tests-unable-card-actions">
@@ -4041,17 +4156,17 @@ ${esc(tmux?.attachB || "")}</pre>
                 <button type="button" class="btn btn-sm btn-danger" data-stop-rerun="${row.id}" hidden>Stop</button>
               </div>
             </div>
-            ${row.pr_title ? `<p style="font-size:0.82rem; color:var(--text-secondary); margin-bottom:0.35rem;">${esc(row.pr_title)}</p>` : ""}
-            <p style="font-size:0.82rem; color:var(--accent-orange); margin-bottom:0.35rem;">${esc(row.tests_unable_to_run_reason || "Tests could not be executed")}</p>
-            ${Array.isArray(row.rejection_reasons) && row.rejection_reasons.length ? `<p style="font-size:0.78rem; color:var(--accent-red); margin-bottom:0.5rem;">${esc(row.rejection_reasons.join(" · "))}</p>` : ""}
+            ${row.pr_title ? `<p class="stack-note">${esc(row.pr_title)}</p>` : ""}
+            <p class="stack-note stack-warning">${esc(row.tests_unable_to_run_reason || "Tests could not be executed")}</p>
+            ${Array.isArray(row.rejection_reasons) && row.rejection_reasons.length ? `<p class="stack-note stack-danger">${esc(row.rejection_reasons.join(" · "))}</p>` : ""}
             ${row.details?.rerun?.dockerfileOverride ? `
-              <p style="font-size:0.78rem; color:var(--accent-cyan); margin-bottom:0.5rem;">
+              <p class="stack-note stack-cyan">
                 Rerun Dockerfile: <code>${esc(row.details.rerun.dockerfileOverride.path || "Dockerfile")}</code>
                 (${esc((row.details.rerun.dockerfileOverride.sha256 || "").slice(0, 12)) || "no hash"})
               </p>
             ` : ""}
             ${Array.isArray(row.details?.rerun?.execution?.notes) && row.details.rerun.execution.notes.length ? `
-              <p style="font-size:0.78rem; color:var(--text-secondary); margin-bottom:0.5rem;">
+              <p class="stack-note">
                 ${esc(row.details.rerun.execution.notes.join(" · "))}
               </p>
             ` : ""}
@@ -4065,7 +4180,7 @@ ${esc(tmux?.attachB || "")}</pre>
             }))}
             <div class="tests-unable-editor" data-dockerfile-editor="${row.id}" data-loaded="false" hidden>
               <div class="tests-unable-editor-header">
-                <div class="form-group" style="margin:0; flex:1;">
+                <div class="form-group field-stretch">
                   <label>Dockerfile Path</label>
                   <input type="text" data-dockerfile-path="${row.id}" value="${esc(preferredDockerfilePath(row))}" placeholder="Dockerfile" spellcheck="false">
                 </div>
@@ -4083,11 +4198,11 @@ ${esc(tmux?.attachB || "")}</pre>
               <pre class="log-output log-output-compact tests-unable-live-output" data-rerun-output="${row.id}">Waiting for Docker output…</pre>
             </div>
             ${row.logFiles?.length ? row.logFiles.map((log) => `
-              <details style="margin-top:0.5rem;">
-                <summary style="cursor:pointer; color:var(--accent-blue);">${esc(log.label)}</summary>
+              <details class="log-detail-list">
+                <summary>${esc(log.label)}</summary>
                 <pre class="log-output log-output-compact">${esc(log.excerpt)}</pre>
               </details>
-            `).join("") : '<p style="font-size:0.78rem; color:var(--text-muted);">No execution log is available for this candidate.</p>'}
+            `).join("") : '<p class="stack-note stack-muted">No execution log is available for this candidate.</p>'}
           </div>
         `).join("")}
       `;
@@ -4341,7 +4456,7 @@ ${esc(tmux?.attachB || "")}</pre>
     if (totalPages <= 1) { container.innerHTML = ""; return; }
     let html = "";
     if (current > 0) html += `<button class="btn btn-sm" data-p="${current - 1}">← Prev</button>`;
-    html += `<span style="font-size:0.82rem; color:var(--text-secondary);">Page ${current + 1} of ${totalPages}</span>`;
+    html += `<span class="pagination-label">Page ${current + 1} of ${totalPages}</span>`;
     if (current < totalPages - 1) html += `<button class="btn btn-sm" data-p="${current + 1}">Next →</button>`;
     container.innerHTML = html;
     $$("[data-p]", container).forEach((btn) => {
@@ -4491,6 +4606,7 @@ ${esc(tmux?.attachB || "")}</pre>
   }
 
   /* ---- Init ---- */
+  updateChrome(currentPage);
   bindDashboardActions($("#page-dashboard"));
   loadDashboard();
 })();
