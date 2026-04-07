@@ -7,7 +7,8 @@
   <meta name="description" content="Mine GitHub repos for merged bug-fix PRs with linked issues and validate pre-fix snapshots in Docker.">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght@400" rel="stylesheet">
   <link rel="stylesheet" href="/style.css">
 </head>
 <body>
@@ -15,23 +16,67 @@
     <!-- Sidebar -->
     <nav id="sidebar">
       <div class="sidebar-logo">
-        <span class="logo-icon">⛏️</span>
-        <h1>Repo Miner</h1>
+        <div class="sidebar-logo-mark">
+          <span class="material-symbols-outlined">deployed_code</span>
+        </div>
+        <div class="sidebar-logo-copy">
+          <h1>Repo Issue Miner</h1>
+          <p class="sidebar-version">v2.4.0-kinetic</p>
+        </div>
       </div>
+      <p class="sidebar-label">Main Dashboard</p>
       <ul class="nav-links">
-        <li><a href="#" data-page="dashboard" class="active" id="nav-dashboard"><span class="nav-icon">📊</span> Dashboard</a></li>
-        <li><a href="#" data-page="repos" id="nav-repos"><span class="nav-icon">📦</span> Repos</a></li>
-        <li><a href="#" data-page="setup" id="nav-setup"><span class="nav-icon">🛠️</span> Setup</a></li>
-        <li><a href="#" data-page="accepted" id="nav-accepted"><span class="nav-icon">✅</span> Accepted</a></li>
-        <li><a href="#" data-page="tasks" id="nav-tasks"><span class="nav-icon">🧠</span> Tasks</a></li>
-        <li><a href="#" data-page="issues" id="nav-issues"><span class="nav-icon">🐛</span> Issues</a></li>
-        <li><a href="#" data-page="scans" id="nav-scans"><span class="nav-icon">🔍</span> Scans</a></li>
-        <li><a href="#" data-page="new-scan" id="nav-new-scan"><span class="nav-icon">🚀</span> New Scan</a></li>
+        <li><a href="#" data-page="dashboard" class="active" id="nav-dashboard"><span class="nav-icon material-symbols-outlined">dashboard</span><span class="nav-label">Dashboard</span></a></li>
+        <li><a href="#" data-page="repos" id="nav-repos"><span class="nav-icon material-symbols-outlined">database</span><span class="nav-label">Repositories</span></a></li>
+        <li><a href="#" data-page="setup" id="nav-setup"><span class="nav-icon material-symbols-outlined">settings</span><span class="nav-label">Setup</span></a></li>
+        <li><a href="#" data-page="accepted" id="nav-accepted"><span class="nav-icon material-symbols-outlined">check_circle</span><span class="nav-label">Accepted</span></a></li>
+        <li><a href="#" data-page="tasks" id="nav-tasks"><span class="nav-icon material-symbols-outlined">terminal</span><span class="nav-label">Task Workspace</span></a></li>
+        <li><a href="#" data-page="issues" id="nav-issues"><span class="nav-icon material-symbols-outlined">verified</span><span class="nav-label">Verified Issues</span></a></li>
+        <li><a href="#" data-page="scans" id="nav-scans"><span class="nav-icon material-symbols-outlined">history</span><span class="nav-label">Scan History</span></a></li>
+        <li><a href="#" data-page="new-scan" id="nav-new-scan"><span class="nav-icon material-symbols-outlined">speed</span><span class="nav-label">New Scan</span></a></li>
       </ul>
+      <div class="sidebar-footer">
+        <button type="button" class="btn btn-primary sidebar-cta" id="sidebar-start-scan">
+          <span class="material-symbols-outlined">play_arrow</span>
+          Start New Scan
+        </button>
+        <button type="button" class="btn btn-danger sidebar-tests-btn" id="sidebar-open-tests-unable">
+          <span class="material-symbols-outlined">warning</span>
+          Tests Unable
+        </button>
+      </div>
     </nav>
 
     <!-- Main content -->
     <main id="content">
+      <header id="topbar">
+        <div class="topbar-copy">
+          <p class="topbar-eyebrow">Operational Console</p>
+          <div class="topbar-heading-row">
+            <h2 id="topbar-page-title">Dashboard</h2>
+            <span class="topbar-page-chip" id="topbar-page-chip">overview</span>
+          </div>
+          <p id="topbar-page-subtitle">Monitor the mining pipeline, review accepted work, and jump into setup or scan flows.</p>
+        </div>
+        <div class="topbar-actions">
+          <label class="topbar-search" for="global-search">
+            <span class="material-symbols-outlined">search</span>
+            <input type="search" id="global-search" placeholder="Search repositories or issue IDs">
+          </label>
+          <button type="button" class="topbar-icon-button" id="topbar-open-tests-unable" aria-label="Open tests unable workflow">
+            <span class="material-symbols-outlined">warning</span>
+          </button>
+          <button type="button" class="topbar-icon-button" id="topbar-open-new-scan" aria-label="Open new scan">
+            <span class="material-symbols-outlined">add_circle</span>
+          </button>
+          <div class="topbar-status">
+            <span class="topbar-status-light"></span>
+            <span>Status: Ready</span>
+          </div>
+        </div>
+      </header>
+
+      <div id="content-scroll">
       <!-- Dashboard page -->
       <section id="page-dashboard" class="page active">
         <h2 class="page-title">Dashboard</h2>
@@ -398,6 +443,7 @@
           <pre id="scan-log-output" class="log-output"></pre>
         </div>
       </section>
+      </div>
     </main>
   </div>
   <!-- Toast notification container -->
